@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+# dist/ 保留（含 H2C_PcSecCheck.exe）
+build/
+.venv/
+venv/
+
+# PyInstaller build artifacts
+build/
+*.spec.bak
+*.pkg
+
+# Generated reports (produced when running the EXE)
+*.h2cpc.zip
+*.html
+*.xlsx
+*.json
+__pycache__/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.suo
+*.user
