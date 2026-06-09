@@ -1084,6 +1084,16 @@ def _analyze_netstat(netstat):
                 conn,
             ))
 
+        # RDP 不一定只綁 0.0.0.0；若 3389 綁定到特定網卡 IP 也要標記。
+        _is_loopback_bind = local_ip_part.startswith("127.") or local_ip_part in ("::1", "[::1]", "localhost")
+        if state == "LISTENING" and local_port == 3389 and not _is_wildcard and not _is_loopback_bind:
+            findings.append(_finding(
+                "rdp_exposure", 2,
+                "RDP 服務正在非 loopback 位址監聽",
+                f"Port 3389 (RDP) 在 {local_ip_part} 監聽，請確認是否有防火牆來源限制、VPN 或其他控管。",
+                conn,
+            ))
+
     return findings
 
 
