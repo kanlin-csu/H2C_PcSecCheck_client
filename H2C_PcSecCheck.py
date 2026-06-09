@@ -2,6 +2,7 @@
 """
 H2C_PcSecCheck v2.0
 PC 資安健診工具 — 合併版（HTML + XLSX + findings 分析 + .h2cpc.zip 封裝）
+相容：Windows 7 SP1 / Server 2008 R2 SP1 以上（含 Win10 / Server 2022）
 
 Copyright 2026 H2C工作室 甘霖老師
 
@@ -17,6 +18,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 """
+from __future__ import annotations  # 讓 str | None 等語法相容 Python 3.7+
+
 import html
 import io
 import os
@@ -56,7 +59,7 @@ _DECODED_PS_DANGEROUS = re.compile(
 )
 
 
-def _decode_encoded_command(cmdline: str) -> str | None:
+def _decode_encoded_command(cmdline: str) -> "str | None":
     """從命令列中提取並解碼 -EncodedCommand 的 Base64 內容。"""
     import base64
     m = re.search(r"-enc(?:odedcommand)?\s+([A-Za-z0-9+/=]+)", cmdline, re.IGNORECASE)
@@ -314,27 +317,52 @@ def _get_reg_value(key, value_name):
 
 
 def get_local_user_accounts():
+    # 優先使用 Get-LocalUser（Win10 / Server 2016+）
+    # 自動 fallback 到 Win32_UserAccount WMI（Win7 / Server 2008 相容）
     ps_cmd = r"""
 $result = @()
-Get-LocalUser | ForEach-Object {
-    $u = $_
-    $groups = (Get-LocalGroup | Where-Object {
-        (Get-LocalGroupMember $_ -ErrorAction SilentlyContinue |
-         Where-Object { $_.Name -like "*\$($u.Name)" }) -ne $null
-    }).Name -join ", "
-    $result += [PSCustomObject]@{
-        Name            = $u.Name
-        Enabled         = $u.Enabled
-        Description     = $u.Description
-        LastLogon       = if ($u.LastLogon) { $u.LastLogon.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
-        PasswordLastSet = if ($u.PasswordLastSet) { $u.PasswordLastSet.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
-        PasswordExpires = if ($u.PasswordExpires) { $u.PasswordExpires.ToString("yyyy-MM-dd HH:mm:ss") } else { "永不到期" }
-        Groups          = $groups
+$useWMI = $false
+try {
+    $users = Get-LocalUser -ErrorAction Stop
+    foreach ($u in $users) {
+        $groups = ""
+        try {
+            $groups = (Get-LocalGroup -ErrorAction SilentlyContinue | Where-Object {
+                (Get-LocalGroupMember $_ -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -like "*\$($u.Name)" }) -ne $null
+            }).Name -join ", "
+        } catch {}
+        $result += [PSCustomObject]@{
+            Name            = $u.Name
+            Enabled         = $u.Enabled
+            Description     = $u.Description
+            LastLogon       = if ($u.LastLogon) { $u.LastLogon.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
+            PasswordLastSet = if ($u.PasswordLastSet) { $u.PasswordLastSet.ToString("yyyy-MM-dd HH:mm:ss") } else { "" }
+            PasswordExpires = if ($u.PasswordExpires) { $u.PasswordExpires.ToString("yyyy-MM-dd HH:mm:ss") } else { "永不到期" }
+            Groups          = $groups
+        }
+    }
+} catch {
+    $useWMI = $true
+}
+if ($useWMI) {
+    # Win7 / Server 2008 fallback：WMI Win32_UserAccount
+    Get-WmiObject Win32_UserAccount -Filter "LocalAccount=True" | ForEach-Object {
+        $result += [PSCustomObject]@{
+            Name            = $_.Name
+            Enabled         = -not $_.Disabled
+            Description     = $_.Description
+            LastLogon       = ""
+            PasswordLastSet = ""
+            PasswordExpires = if ($_.PasswordExpires) { "（請手動確認）" } else { "永不到期" }
+            Groups          = ""
+        }
     }
 }
-$result | ConvertTo-Json
+try { $result | ConvertTo-Json } catch { $result | ForEach-Object { $_.Name + "|" + $_.Enabled + "|" + $_.Description + "|" + $_.LastLogon + "|" + $_.PasswordLastSet + "|" + $_.PasswordExpires + "|" + $_.Groups } }
 """
     result_json = run_powershell(ps_cmd)
+    # 嘗試 JSON 解析
     try:
         data = json.loads(result_json)
         if isinstance(data, dict):
@@ -352,7 +380,22 @@ $result | ConvertTo-Json
             })
         return result
     except Exception:
-        return []
+        pass
+    # Pipe 格式 fallback（PS2 無 ConvertTo-Json 時）
+    result = []
+    for line in result_json.splitlines():
+        parts = line.split("|", 6)
+        if len(parts) >= 2:
+            result.append({
+                "帳號名稱":    parts[0] if len(parts) > 0 else "",
+                "是否啟用":    "啟用" if parts[1].strip().lower() == "true" else "停用" if len(parts) > 1 else "",
+                "描述":        parts[2] if len(parts) > 2 else "",
+                "上次登入":    parts[3] if len(parts) > 3 else "",
+                "密碼上次設定": parts[4] if len(parts) > 4 else "",
+                "密碼到期":    parts[5] if len(parts) > 5 else "",
+                "所屬群組":    parts[6] if len(parts) > 6 else "",
+            })
+    return result
 
 
 def get_password_policy():
@@ -452,7 +495,7 @@ ForEach-Object {
         return []
 
 
-def _read_startup_approved(hive, reg_path: str) -> dict[str, str]:
+def _read_startup_approved(hive, reg_path: str) -> "dict[str, str]":
     """
     讀取 StartupApproved 鍵，回傳 {名稱: 狀態字串}。
     第一個 byte：02/00 = 啟用，03 = 使用者停用，06/04 = Windows 停用
@@ -602,76 +645,179 @@ $result | ConvertTo-Json
 
 
 def get_firewall_status():
+    # 優先：Get-NetFirewallProfile（Win8 / Server 2012+）
+    # Fallback：netsh advfirewall（Win7 / Server 2008 相容）
     ps_cmd = r"""
-$profiles = Get-NetFirewallProfile | Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction
-$profiles | ConvertTo-Json
+try {
+    $profiles = Get-NetFirewallProfile -ErrorAction Stop |
+        Select-Object Name, Enabled, DefaultInboundAction, DefaultOutboundAction
+    try { $profiles | ConvertTo-Json }
+    catch {
+        $profiles | ForEach-Object {
+            $_.Name + "|" + $_.Enabled + "|" + $_.DefaultInboundAction + "|" + $_.DefaultOutboundAction
+        }
+    }
+} catch {
+    # Win7 fallback：netsh advfirewall
+    $out = netsh advfirewall show allprofiles state 2>&1
+    $out
+}
 """
-    result_json = run_powershell(ps_cmd)
+    raw = run_powershell(ps_cmd)
+    # 嘗試 JSON
     try:
-        data = json.loads(result_json)
+        data = json.loads(raw)
         if isinstance(data, dict):
             data = [data]
-        result = []
-        for item in data:
-            result.append({
-                "設定檔":           item.get("Name", ""),
-                "啟用":             "是" if item.get("Enabled") else "否",
-                "預設入站動作":     item.get("DefaultInboundAction", ""),
-                "預設出站動作":     item.get("DefaultOutboundAction", ""),
-            })
-        return result
+        return [{
+            "設定檔":       item.get("Name", ""),
+            "啟用":         "是" if item.get("Enabled") else "否",
+            "預設入站動作": item.get("DefaultInboundAction", ""),
+            "預設出站動作": item.get("DefaultOutboundAction", ""),
+        } for item in data]
     except Exception:
-        return [{"設定檔": "無法取得", "啟用": "無法取得", "預設入站動作": "", "預設出站動作": ""}]
+        pass
+    # Pipe 格式 fallback
+    result = []
+    for line in raw.splitlines():
+        parts = line.split("|", 3)
+        if len(parts) >= 2:
+            result.append({
+                "設定檔":       parts[0].strip(),
+                "啟用":         "是" if parts[1].strip().lower() == "true" else "否",
+                "預設入站動作": parts[2].strip() if len(parts) > 2 else "",
+                "預設出站動作": parts[3].strip() if len(parts) > 3 else "",
+            })
+    if result:
+        return result
+    # netsh 文字格式解析（Win7）
+    result = []
+    current_profile = ""
+    for line in raw.splitlines():
+        line = line.strip()
+        m_profile = re.match(r"^(Domain|Private|Public)\s+Profile\s+Settings", line, re.I)
+        if m_profile:
+            current_profile = m_profile.group(1)
+        if current_profile and line.lower().startswith("state"):
+            parts = line.split(None, 1)
+            state = parts[1].strip() if len(parts) > 1 else ""
+            result.append({
+                "設定檔":       current_profile,
+                "啟用":         "是" if "on" in state.lower() else "否",
+                "預設入站動作": "",
+                "預設出站動作": "",
+            })
+            current_profile = ""
+    return result if result else [{"設定檔": "無法取得", "啟用": "無法取得", "預設入站動作": "", "預設出站動作": ""}]
 
 
 def get_smb_status():
+    # 優先：Get-SmbServerConfiguration（Win8 / Server 2012+）
+    # Fallback：Registry 直讀（Win7 / Server 2008 相容）
     ps_cmd = r"""
 $result = @()
+$usedSmbCmdlet = $false
 try {
-    $smb1 = (Get-SmbServerConfiguration | Select-Object EnableSMB1Protocol).EnableSMB1Protocol
-    $smb2 = (Get-SmbServerConfiguration | Select-Object EnableSMB2Protocol).EnableSMB2Protocol
-    $result += [PSCustomObject]@{ 設定 = "SMBv1 啟用狀態"; 值 = $smb1.ToString() }
+    $cfg  = Get-SmbServerConfiguration -ErrorAction Stop
+    $smb1 = $cfg.EnableSMB1Protocol
+    $smb2 = $cfg.EnableSMB2Protocol
+    $result += [PSCustomObject]@{ 設定 = "SMBv1 啟用狀態";   值 = $smb1.ToString() }
     $result += [PSCustomObject]@{ 設定 = "SMBv2/3 啟用狀態"; 值 = $smb2.ToString() }
-} catch {
-    $result += [PSCustomObject]@{ 設定 = "SMB 狀態"; 值 = "無法取得" }
+    $usedSmbCmdlet = $true
+} catch {}
+if (-not $usedSmbCmdlet) {
+    # Win7 fallback：讀 Registry
+    try {
+        $key  = "HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters"
+        $smb1 = (Get-ItemProperty -Path $key -Name "SMB1" -ErrorAction SilentlyContinue).SMB1
+        $smb2 = (Get-ItemProperty -Path $key -Name "SMB2" -ErrorAction SilentlyContinue).SMB2
+        # SMB1 Registry=1 or null（預設啟用）；=0 停用
+        $smb1Enabled = if ($smb1 -eq $null) { "True（未設定，預設啟用）" } elseif ($smb1 -eq 0) { "False" } else { "True" }
+        $smb2Enabled = if ($smb2 -eq $null) { "True（未設定，預設啟用）" } elseif ($smb2 -eq 0) { "False" } else { "True" }
+        $result += [PSCustomObject]@{ 設定 = "SMBv1 啟用狀態（Registry）";   值 = $smb1Enabled }
+        $result += [PSCustomObject]@{ 設定 = "SMBv2/3 啟用狀態（Registry）"; 值 = $smb2Enabled }
+    } catch {
+        $result += [PSCustomObject]@{ 設定 = "SMB 狀態"; 值 = "無法取得（$($_.Exception.Message)）" }
+    }
 }
 try {
     $feat = (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop).State
     $result += [PSCustomObject]@{ 設定 = "SMBv1 Windows 功能"; 值 = $feat }
 } catch {}
-$result | ConvertTo-Json
+try { $result | ConvertTo-Json }
+catch { $result | ForEach-Object { $_.設定 + "|" + $_.值 } }
 """
-    result_json = run_powershell(ps_cmd)
+    raw = run_powershell(ps_cmd)
     try:
-        data = json.loads(result_json)
+        data = json.loads(raw)
         if isinstance(data, dict):
             data = [data]
         return [{"設定": item.get("設定", ""), "值": str(item.get("值", ""))} for item in data]
     except Exception:
-        return [{"設定": "無法取得", "值": ""}]
+        pass
+    result = []
+    for line in raw.splitlines():
+        if "|" in line:
+            k, _, v = line.partition("|")
+            result.append({"設定": k.strip(), "值": v.strip()})
+    return result if result else [{"設定": "無法取得", "值": ""}]
 
 
 def get_shared_folders():
+    # 優先：Get-SmbShare（Win8 / Server 2012+）
+    # Fallback：net share（Win7 / Server 2008 相容）
     ps_cmd = r"""
-Get-SmbShare | Select-Object Name, Path, Description, ShareType |
-ConvertTo-Json
+try {
+    $shares = Get-SmbShare -ErrorAction Stop | Select-Object Name, Path, Description, ShareType
+    try { $shares | ConvertTo-Json }
+    catch { $shares | ForEach-Object { $_.Name + "|" + $_.Path + "|" + $_.Description + "|" + $_.ShareType } }
+} catch {
+    # Win7 fallback
+    net share 2>&1
+}
 """
-    result_json = run_powershell(ps_cmd)
+    raw = run_powershell(ps_cmd)
+    # JSON 解析
     try:
-        data = json.loads(result_json)
+        data = json.loads(raw)
         if isinstance(data, dict):
             data = [data]
-        result = []
-        for item in data:
-            result.append({
-                "共用名稱":  item.get("Name", ""),
-                "路徑":      item.get("Path", ""),
-                "說明":      item.get("Description", ""),
-                "類型":      str(item.get("ShareType", "")),
-            })
-        return result
+        return [{
+            "共用名稱": item.get("Name", ""),
+            "路徑":     item.get("Path", ""),
+            "說明":     item.get("Description", ""),
+            "類型":     str(item.get("ShareType", "")),
+        } for item in data]
     except Exception:
-        return []
+        pass
+    # Pipe 格式 fallback
+    result = []
+    for line in raw.splitlines():
+        if "|" in line:
+            parts = line.split("|", 3)
+            result.append({
+                "共用名稱": parts[0].strip() if len(parts) > 0 else "",
+                "路徑":     parts[1].strip() if len(parts) > 1 else "",
+                "說明":     parts[2].strip() if len(parts) > 2 else "",
+                "類型":     parts[3].strip() if len(parts) > 3 else "",
+            })
+    if result:
+        return result
+    # net share 文字格式解析（Win7）
+    result = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("-") or line.startswith("Share") or line.startswith("共用") or line.lower().startswith("the command"):
+            continue
+        parts = line.split(None, 2)
+        if len(parts) >= 2:
+            result.append({
+                "共用名稱": parts[0],
+                "路徑":     parts[1],
+                "說明":     parts[2] if len(parts) > 2 else "",
+                "類型":     "",
+            })
+    return result
 
 
 def get_audit_policy():
