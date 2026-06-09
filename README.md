@@ -1,9 +1,9 @@
 # H2C_PcSecCheck
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-0078d4.svg)](README.md)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-0078d4.svg)](README.md)
 
-PC / Linux 主機資安健診工具。在受測電腦執行後，自動收集系統資訊並產生標準化報告包（`.h2cpc.zip`）。
+PC / Linux / macOS 主機資安健診工具。在受測電腦執行後，自動收集系統資訊並產生標準化報告包（`.h2cpc.zip`）。
 
 > **開發單位**：H2C 工作室  
 > **開發者**：甘霖老師
@@ -27,7 +27,7 @@ PC / Linux 主機資安健診工具。在受測電腦執行後，自動收集系
 
 ### 執行權限需求
 
-Windows 版需以**系統管理員（Administrator）** 身份執行，Linux 版建議以 **root / sudo** 執行，原因如下：
+Windows 版需以**系統管理員（Administrator）** 身份執行，Linux / macOS 版建議以 **root / sudo** 執行，原因如下：
 
 | 收集項目 | 需要管理員的原因 |
 |---------|---------------|
@@ -38,6 +38,7 @@ Windows 版需以**系統管理員（Administrator）** 身份執行，Linux 版
 | Windows 防火牆 / SMB 設定 | PowerShell `Get-NetFirewallProfile`、`Get-SmbServerConfiguration` 需管理員 |
 | Linux 使用者 / 密碼期限 | `chage`、`lastlog`、`/etc/shadow` 相關資訊需 root 才能完整讀取 |
 | Linux 稽核 / 防火牆 / 程序資訊 | `auditctl`、`iptables`、`/proc/PID/exe` 等資料需 root 才能完整取得 |
+| macOS 安全設定 / 程序資訊 | FileVault、Firewall、audit、`lsof`、部分程序路徑與系統設定需 sudo 才能完整取得 |
 
 > **若以一般使用者執行**，部分項目將顯示為空值或收集不完整，影響健診報告的準確性。
 
@@ -88,6 +89,26 @@ Windows 版需以**系統管理員（Administrator）** 身份執行，Linux 版
 | 網路分享 / 對外目錄 | Samba、NFS exports |
 | 容器環境 | Docker / Podman 執行中容器 |
 | 程序情資素材 | 程序 SHA256、套件來源、deleted binary、平台情資比對欄位 |
+| Hosts 檔案 | 非標準項目偵測 |
+
+### macOS 版
+
+| 類別 | 收集內容 |
+|------|---------|
+| 系統資訊 | hostname、IP、macOS 版本、Kernel、硬體型號、CPU、記憶體 |
+| 更新狀態 | `softwareupdate` 可用系統更新、Homebrew 可更新套件 |
+| 端點防護 | XProtect、Gatekeeper、MRT、常見第三方 EDR / AV 偵測 |
+| FileVault | 磁碟加密狀態 |
+| SIP | System Integrity Protection 狀態 |
+| 防火牆 | Application Firewall、Stealth Mode、PF 狀態 |
+| 帳號與權限 | 本機使用者、UID、admin 群組、shell、home 目錄 |
+| 密碼原則 | `pwpolicy` 帳號政策 |
+| SSH 安全設定 | root login、password authentication、empty password |
+| 啟動項目 | LaunchDaemons、LaunchAgents、User LaunchAgents |
+| 稽核原則 | `/etc/security/audit_control`、auditd 狀態 |
+| Kernel Hardening | macOS sysctl 安全參數 |
+| 網路分享 / 對外目錄 | macOS sharing、NFS exports |
+| 程序情資素材 | 程序 SHA256、pkgutil 套件來源、平台情資比對欄位 |
 | Hosts 檔案 | 非標準項目偵測 |
 
 ### 風險自動分析（Findings）
@@ -192,16 +213,40 @@ Linux 版報告會在最上方產生 **「行政院資安健診重點摘要」**
 | `first_seen` | 管理平台首次發現時間 |
 | `last_seen` | 管理平台最後發現時間 |
 
+### macOS 版
+
+macOS 版目前提供原始 Python 腳本：
+
+```bash
+sudo python3 H2C_PcSecCheck_macos.py
+```
+
+建議以 `sudo` 執行，否則部分系統安全設定、程序路徑、網路連線與稽核資訊可能無法完整讀取。
+
+macOS 版報告同樣會產生 **「行政院資安健診重點摘要」**，重點包含：
+
+| 重點項目 | 說明 |
+|---------|------|
+| FileVault | 磁碟加密是否啟用 |
+| SIP | System Integrity Protection 是否啟用 |
+| Gatekeeper | 是否允許未簽章程式防護 |
+| 防火牆 | Application Firewall / PF 狀態 |
+| 帳號盤點 | 本機一般帳號與 admin 群組 |
+| SSH 安全 | root login、密碼登入、空密碼 |
+| 稽核記錄 | auditd 與 audit_control |
+| 修補狀態 | macOS / Homebrew 可更新項目 |
+
 ---
 
 ## 系統需求
 
 - Windows 7 SP1 / Server 2008 R2 SP1 以上、Windows 10 / 11（x64）
 - Linux：Debian / Ubuntu / Kali / RedHat / CentOS / Fedora 類發行版
+- macOS：建議 macOS 12 Monterey 以上
 - Windows 版需**系統管理員（Administrator）權限**
-- Linux 版建議 **root / sudo** 權限
+- Linux / macOS 版建議 **root / sudo** 權限
 - Windows exe 不需要安裝 Python 或任何套件
-- Linux 腳本版需 Python 3 與 `openpyxl`
+- Linux / macOS 腳本版需 Python 3 與 `openpyxl`
 - 執行期間無需網際網路連線
 
 ---
@@ -221,6 +266,12 @@ sudo python3 H2C_PcSecCheck_linux.py
 
 # Linux 打包（需在 Linux 主機上執行）
 pyinstaller H2C_PcSecCheck_linux.py --onefile --name H2C_PcSecCheck_linux --noconfirm
+
+# macOS 執行
+sudo python3 H2C_PcSecCheck_macos.py
+
+# macOS 打包（需在 macOS 主機上執行）
+pyinstaller H2C_PcSecCheck_macos.py --onefile --name H2C_PcSecCheck_macos --noconfirm
 ```
 
 ---
