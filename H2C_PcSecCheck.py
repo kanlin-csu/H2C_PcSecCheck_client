@@ -197,10 +197,15 @@ Select-Object -First 1 -ExpandProperty IPAddress
 
 
 def run_powershell(command, timeout=60):
+    # 兩端固定 UTF-8，避免因機器的作用中 code page 不同（chcp 950 Big5 / chcp 65001 UTF-8）
+    # 造成 ConvertTo-Json 的中文屬性名亂碼、Python 端解碼失敗，進而讓欄位全空。
+    # 必須「PowerShell 輸出」與「Python 解碼」都釘死 UTF-8，只改一邊會在另一種 code page 的機器上壞掉。
+    command = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()\n" + command
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
             capture_output=True, text=True, timeout=timeout,
+            encoding="utf-8", errors="replace",
         )
         return proc.stdout
     except subprocess.TimeoutExpired:
@@ -614,12 +619,14 @@ netstat -ano | Select-String "^\s+(TCP|UDP)" | ForEach-Object {
     $proto   = $parts[0]
     $local   = $parts[1]
     $foreign = $parts[2]
-    if ($proto -eq "TCP") { $state = $parts[3]; $pid = [int]$parts[4] }
-    else                  { $state = "";         $pid = [int]$parts[3] }
-    $procName = if ($pidMap.ContainsKey($pid)) { $pidMap[$pid] } else { "" }
+    # 注意：$pid 是 PowerShell 內建唯讀自動變數（本 PS 程序自身的 PID），不可指派，
+    # 否則每筆連線的 PID/程序名稱都會變成執行掃描的 powershell。改用 $procId。
+    if ($proto -eq "TCP") { $state = $parts[3]; $procId = [int]$parts[4] }
+    else                  { $state = "";         $procId = [int]$parts[3] }
+    $procName = if ($pidMap.ContainsKey($procId)) { $pidMap[$procId] } else { "" }
     $result += [PSCustomObject]@{
         協定 = $proto; 本地位址 = $local; 遠端位址 = $foreign
-        狀態 = $state; PID = $pid; 程序名稱 = $procName
+        狀態 = $state; PID = $procId; 程序名稱 = $procName
     }
 }
 $result | ConvertTo-Json
