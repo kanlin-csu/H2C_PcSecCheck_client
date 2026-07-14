@@ -2,7 +2,8 @@
 """
 H2C_PcSecCheck v2.0
 PC 資安健診工具 — 合併版（HTML + XLSX + findings 分析 + .h2cpc.zip 封裝）
-相容：Windows 7 SP1 / Server 2008 R2 SP1 以上（含 Win10 / Server 2022）
+相容：Windows 8.1 / Server 2012 R2 以上（含 Win10 / 11、Server 2016–2022）
+      預編 exe 以 Python 3.10 打包，不支援 Win7 / 8、Server 2008 R2 / 2012（非 R2）。
 
 Copyright 2026 H2C工作室 甘霖老師
 
@@ -160,12 +161,18 @@ def _is_private_ip(ip: str) -> bool:
 # 資料收集
 # ─────────────────────────────────────────────────────────────────────────────
 def get_local_ip_address():
-    # 方法一：問 OS 路由表「連外網用哪個 IP」，自動跳過 VMware/虛擬網卡
+    # 方法一：問 OS 路由表「連外網用哪個 IP」，自動跳過 VMware/虛擬網卡。
+    # 用 UDP socket + connect：只做路由表查詢以決定來源 IP，實際上「不送出任何封包」，
+    # 維持本工具「不建立對外網路連線」的保證（TCP create_connection 會真的連往 8.8.8.8）。
     try:
-        with socket.create_connection(("8.8.8.8", 80), timeout=3) as s:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
             ip = s.getsockname()[0]
-            if ip and not ip.startswith("127."):
-                return ip
+        finally:
+            s.close()
+        if ip and not ip.startswith("127."):
+            return ip
     except Exception:
         pass
     # 方法二（fallback）：找有設 DNS 的網卡第一筆 IPv4

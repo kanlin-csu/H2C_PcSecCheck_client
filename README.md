@@ -240,7 +240,10 @@ macOS 版報告同樣會產生 **「行政院資安健診重點摘要」**，重
 
 ## 系統需求
 
-- Windows 7 SP1 / Server 2008 R2 SP1 以上、Windows 10 / 11（x64）
+- Windows 8.1 / Windows Server 2012 R2 以上，Windows 10 / 11、Server 2016 / 2019 / 2022（x64）
+  - > 預編 exe 以 Python 3.10 打包，**執行環境最低需 Windows 8.1 / Server 2012 R2**；
+  >   **不支援 Windows 7 / 8、Server 2008 R2 / 2012（非 R2）**（無法啟動）。
+  >   若確有舊系統需求，需改用 Python 3.8 自行重新編譯。
 - Linux：Debian / Ubuntu / Kali / RedHat / CentOS / Fedora 類發行版
 - macOS：建議 macOS 12 Monterey 以上
 - Windows 版需**系統管理員（Administrator）權限**
