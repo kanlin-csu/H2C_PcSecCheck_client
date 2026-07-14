@@ -197,15 +197,18 @@ Select-Object -First 1 -ExpandProperty IPAddress
 
 
 def run_powershell(command, timeout=60):
-    # 兩端固定 UTF-8，避免因機器的作用中 code page 不同（chcp 950 Big5 / chcp 65001 UTF-8）
-    # 造成 ConvertTo-Json 的中文屬性名亂碼、Python 端解碼失敗，進而讓欄位全空。
-    # 必須「PowerShell 輸出」與「Python 解碼」都釘死 UTF-8，只改一邊會在另一種 code page 的機器上壞掉。
-    command = "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new()\n" + command
+    # 兩端固定 cp950（Big5），不受機器 chcp 影響。
+    # 為什麼是 cp950 而非 UTF-8：auditpol / systeminfo 等「原生命令」一定以 OEM/cp950
+    # 輸出在地化中文，無法改成 UTF-8；若強制 UTF-8 會把這些原生命令的中文毀掉
+    # （只剩 ASCII 片段）。把 PowerShell 輸出與 Python 解碼都對齊 cp950，才能同時
+    # 兼顧「ConvertTo-Json 的中文鍵名」與「原生命令的中文輸出」。本工具介面與目標
+    # 繁中系統的在地字串都可用 Big5 表示，故釘 950。
+    command = "[Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(950)\n" + command
     try:
         proc = subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
             capture_output=True, text=True, timeout=timeout,
-            encoding="utf-8", errors="replace",
+            encoding="cp950", errors="replace",
         )
         return proc.stdout
     except subprocess.TimeoutExpired:
