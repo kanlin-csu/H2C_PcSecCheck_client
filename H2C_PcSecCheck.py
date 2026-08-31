@@ -1001,6 +1001,16 @@ def _analyze_processes(processes, process_hashes):
     findings = []
     pid_map = {p["PID"]: (p.get("程序名稱") or "").lower()
                for p in processes if p.get("PID")}
+
+    # 排除掃描工具自身：常從 Downloads/桌面/暫存 執行，會觸發「可疑路徑」自我誤報；
+    # onefile 打包在 Windows 為「bootloader 母程序 + app 子程序」兩支同名，故 PID 取自身
+    # 與父程序，另以名稱子字串兜底（涵蓋以原始碼執行、或被改名的情況）。
+    _self_pid  = os.getpid()
+    _self_ppid = next((p.get("父PID") for p in processes if p.get("PID") == _self_pid), None)
+    _self_pids = {_self_pid, _self_ppid}
+
+    def _is_self(pid, name):
+        return pid in _self_pids or "h2c_pcseccheck" in (name or "")
     _known_no_path = {
         # Windows 核心虛擬化安全（VBS / Credential Guard，VTL1 隔離，路徑不可見）
         "lsaiso.exe",
@@ -1034,8 +1044,8 @@ def _analyze_processes(processes, process_hashes):
         parent_name = pid_map.get(parent_pid, "") if parent_pid else ""
         ctx = _proc_context(pid, parent_pid, parent_name)
 
-        # 可疑路徑
-        if path and _SUSPICIOUS_PATHS.search(path):
+        # 可疑路徑（掃描工具自身除外）
+        if path and _SUSPICIOUS_PATHS.search(path) and not _is_self(pid, name):
             findings.append(_finding(
                 "suspicious_process", 3,
                 f"程序執行於可疑路徑: {proc['程序名稱']}",
