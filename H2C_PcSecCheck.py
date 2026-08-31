@@ -23,6 +23,7 @@ from __future__ import annotations  # 讓 str | None 等語法相容 Python 3.7+
 
 import html
 import io
+import ipaddress
 import os
 import re
 import socket
@@ -135,12 +136,35 @@ _PRIVATE_NETS = (
     re.compile(r"^172\.(1[6-9]|2\d|3[01])\."),
     re.compile(r"^192\.168\."),
     re.compile(r"^127\."),
+    re.compile(r"^169\.254\."),
+    re.compile(r"^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\."),  # CGNAT 100.64/10
     re.compile(r"^::1$"),
-    re.compile(r"^fe80:", re.I),
+    re.compile(r"^fe80:", re.I),                              # link-local
+    re.compile(r"^f[cd][0-9a-f]{2}:", re.I),                  # ULA fc00::/7
     re.compile(r"^0\.0\.0\.0$"),
 )
 _MALICIOUS_PORTS   = {4444, 5555, 6666, 1337, 31337, 9001}
 _SENSITIVE_LISTEN  = {445, 3389, 5985}
+
+# 對外連線時風險偏低的「標準服務 port」→ 降為 Low（仍保留 finding，不隱藏）。
+# 刻意不含 22(SSH) / 25(SMTP 直送) / 389,636(LDAP) / 5985,5986(WinRM)：那些是
+# reverse tunnel / 橫向移動 / 直接外洩最常被濫用的 port，維持 Medium。
+# 5228-5230(Google 推播) 於此僅降級；「對端是否真為 Google IP」由中央端(VANS)再判。
+_LOW_RISK_EXTERNAL_PORTS = {
+    1433, 3306, 5432,          # DB client（MSSQL / MySQL / PostgreSQL）
+    465, 587,                  # SMTP submission（STARTTLS / SMTPS）
+    993, 995, 143, 110,        # IMAP(S) / POP3(S) 收信
+    3389,                      # RDP outbound
+    123, 853,                  # NTP、DNS-over-TLS
+    5228, 5229, 5230,          # Google FCM/GCM 推播（Chrome / Electron app）
+}
+_PORT_SERVICE = {
+    1433: "MSSQL", 3306: "MySQL", 5432: "PostgreSQL",
+    465: "SMTPS", 587: "SMTP submission",
+    993: "IMAPS", 995: "POP3S", 143: "IMAP", 110: "POP3",
+    3389: "RDP", 123: "NTP", 853: "DNS-over-TLS",
+    5228: "Google 推播", 5229: "Google 推播", 5230: "Google 推播",
+}
 
 SEVERITY_LABEL = {4: "Critical", 3: "High", 2: "Medium", 1: "Low", 0: "Info"}
 SEVERITY_COLOR = {
@@ -152,9 +176,54 @@ RISK_COLORS = {
 }
 
 
+def _norm_ip(ip: str) -> str:
+    """去除 IPv6 中括號與 zone id：'[fe80::1%12]' → 'fe80::1'。"""
+    return (ip or "").strip().strip("[]").split("%", 1)[0]
+
+
 def _is_private_ip(ip: str) -> bool:
-    ip = ip.split(":")[0]
-    return any(p.match(ip) for p in _PRIVATE_NETS)
+    """非公網可路由位址（私網 / loopback / link-local / ULA / CGNAT / 保留）。IPv4、IPv6 皆適用。
+
+    舊版先做 ip.split(':')[0] 再比對 IPv4 正則，導致 '::1' / '[::1]' / 'fe80::…'
+    全被判成公網（誤報「對外連線」）。改以 ipaddress 正確判斷，無法解析時才退回正則。
+    """
+    raw = _norm_ip(ip)
+    try:
+        a = ipaddress.ip_address(raw)
+        return (a.is_private or a.is_loopback or a.is_link_local
+                or a.is_multicast or a.is_reserved or a.is_unspecified)
+    except ValueError:
+        pass
+    host = raw.split(":")[0] if raw.count(":") == 1 else raw   # 裸 host:port 後備
+    return any(p.match(host) for p in _PRIVATE_NETS)
+
+
+def _is_link_local(ip: str) -> bool:
+    """link-local（IPv6 fe80::/10 或 IPv4 169.254/16）—— 非對外，但屬同網段可達。"""
+    raw = _norm_ip(ip)
+    try:
+        return ipaddress.ip_address(raw).is_link_local
+    except ValueError:
+        return raw.lower().startswith("fe80:") or raw.startswith("169.254.")
+
+
+def _split_hostport(addr: str) -> tuple[str, int]:
+    """拆 'ip:port' / '[ipv6]:port' / '[ipv6%zone]:port' → (ip, port)。無法解析時 port=0。"""
+    addr = (addr or "").strip()
+    if not addr:
+        return "", 0
+    if addr.startswith("["):                      # [ipv6]:port
+        host, _, port = addr.partition("]")
+        host, port = host[1:], port.lstrip(":")
+    elif addr.count(":") == 1:                     # ipv4:port
+        host, _, port = addr.rpartition(":")
+    else:                                          # 裸 IPv6 或無 port
+        host, port = addr, ""
+    host = host.split("%", 1)[0]
+    try:
+        return host, int(port)
+    except ValueError:
+        return host, 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1036,19 +1105,8 @@ def _analyze_netstat(netstat):
         foreign = conn.get("遠端位址", "")
         local   = conn.get("本地位址", "")
 
-        foreign_ip       = foreign.rsplit(":", 1)[0] if ":" in foreign else foreign
-        foreign_port_str = foreign.rsplit(":", 1)[1] if ":" in foreign else "0"
-        try:
-            foreign_port = int(foreign_port_str)
-        except Exception:
-            foreign_port = 0
-
-        local_ip_part   = local.rsplit(":", 1)[0] if ":" in local else ""
-        local_port_str  = local.rsplit(":", 1)[1] if ":" in local else "0"
-        try:
-            local_port = int(local_port_str)
-        except Exception:
-            local_port = 0
+        foreign_ip, foreign_port = _split_hostport(foreign)
+        local_ip_part, local_port = _split_hostport(local)
 
         # ESTABLISHED 至公網
         if state == "ESTABLISHED" and foreign_ip and not _is_private_ip(foreign_ip):
@@ -1069,14 +1127,35 @@ def _analyze_netstat(netstat):
                     f"程序 {proc_name} 連線到公網 {foreign}（標準 port，請確認程序是否合法）",
                     conn,
                 ))
+            elif foreign_port in _LOW_RISK_EXTERNAL_PORTS:
+                # 標準服務 port（DB / 收送信 / RDP / NTP / Google 推播…）→ Low，但保留供檢視
+                svc = _PORT_SERVICE.get(foreign_port, str(foreign_port))
+                findings.append(_finding(
+                    "suspicious_connection", 1,
+                    f"對外標準服務 Port 連線：{proc_name} → {foreign}",
+                    f"程序 {proc_name} 連線至公網 {foreign}（{svc} 標準 port，屬常見用途；"
+                    f"如非預期、或目的地非自有主機，仍請確認）",
+                    conn,
+                ))
             else:
-                # 非標準 port → Medium
+                # 真正冷門 port → Medium
                 findings.append(_finding(
                     "suspicious_connection", 2,
                     f"對外非標準 Port 連線：{proc_name} → {foreign}",
                     f"程序 {proc_name} 使用非標準 port {foreign_port} 連線至公網",
                     conn,
                 ))
+
+        # link-local（fe80::/10、169.254/16）→ 非對外，但屬同網段可達，留 Low
+        elif state == "ESTABLISHED" and _is_link_local(foreign_ip):
+            proc_name = conn.get("程序名稱", "")
+            findings.append(_finding(
+                "suspicious_connection", 1,
+                f"同網段 link-local 連線：{proc_name} → {foreign}",
+                f"程序 {proc_name} 與同網段 link-local 位址 {foreign} 建立連線"
+                f"（非對外；如非預期請確認是否為同網段主機互連）",
+                conn,
+            ))
 
         # UDP 至公網
         if (proto == "UDP"
