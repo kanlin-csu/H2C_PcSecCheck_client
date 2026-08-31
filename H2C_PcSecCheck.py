@@ -1014,6 +1014,8 @@ def _analyze_processes(processes, process_hashes):
     _known_no_path = {
         # Windows 核心虛擬化安全（VBS / Credential Guard，VTL1 隔離，路徑不可見）
         "lsaiso.exe",
+        # Windows Hello / NGC（Next Generation Credentials）隔離程序，受保護、路徑不可見
+        "ngciso.exe",
         # Windows 核心早期啟動程序
         "system", "system idle process", "idle", "registry",
         "smss.exe", "csrss.exe", "wininit.exe", "winlogon.exe",
