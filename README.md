@@ -301,5 +301,5 @@ You may obtain a copy of the License at
 |------|------|
 | 開發單位 | H2C 工作室 |
 | 開發者 | 甘霖老師 |
-| 版本 | v2.0.0 |
+| 版本 | v2.1.0 |
 | 授權 | Apache License 2.0 |

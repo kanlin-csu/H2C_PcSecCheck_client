@@ -36,7 +36,7 @@ import hashlib
 import datetime
 from openpyxl import Workbook
 
-TOOL_VERSION = "2.0.0"
+TOOL_VERSION = "2.1.0"
 SCHEMA_VERSION = "2"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,6 +289,8 @@ def run_powershell(command, timeout=60):
         return proc.stdout
     except subprocess.TimeoutExpired:
         return ""
+    except Exception:
+        return ""
 
 
 def get_system_info():
@@ -300,6 +302,7 @@ def get_system_info():
         result = subprocess.run(
             ["systeminfo"],
             capture_output=True, text=True, encoding="cp950", errors="replace",
+            timeout=60,
         )
         for line in result.stdout.splitlines():
             if ":" in line:
@@ -307,8 +310,25 @@ def get_system_info():
                 k, v = parts[0].strip(), parts[1].strip()
                 if k and v:
                     data.append({"項目": k, "內容": v})
+    except subprocess.TimeoutExpired:
+        data.append({"項目": "systeminfo 錯誤", "內容": "逾時（60s）未回應，已略過"})
     except Exception as e:
         data.append({"項目": "systeminfo 錯誤", "內容": str(e)})
+
+    # 以登錄檔取得語系中立、且含 UBR（修訂號）的 OS 版本，覆寫 systeminfo 的在地化欄位。
+    # systeminfo 的「OS 版本」為 10.0.26200 N/A 組建 26200（無 UBR），且鍵名隨系統語系變動
+    # （英文版為 OS Version）；管理平台需要 10.0.<build>.<UBR> 才能判累積更新狀態。
+    osv = _get_os_version_registry()
+    if osv:
+        # 移除 systeminfo 帶來、鍵名在地化且無 UBR 的 OS 版本，改用登錄檔值
+        data[:] = [it for it in data if it.get("項目") not in ("OS 版本", "OS Version")]
+        data.append({"項目": "OS 版本", "內容": osv["os_version"]})
+        if osv.get("ubr") is not None:
+            data.append({"項目": "UBR", "內容": str(osv["ubr"])})
+        if osv.get("display_version"):
+            data.append({"項目": "OS 顯示版本", "內容": osv["display_version"]})
+        if osv.get("product_name"):
+            data.append({"項目": "OS 產品名稱", "內容": osv["product_name"]})
     return data
 
 
@@ -330,6 +350,11 @@ ConvertTo-Json
             for k, v in item.items():
                 if isinstance(v, dict) and "DateTime" in v:
                     item[k] = v["DateTime"]
+            # 病毒碼更新時間常為 /Date(ms)/（PS 5.1 ConvertTo-Json），正規化為 ISO 日期
+            raw = item.get("AntivirusSignatureLastUpdated")
+            dt = _parse_ps_date(raw)
+            if dt is not None:
+                item["AntivirusSignatureLastUpdated"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         return data
     except Exception:
         return [{"AMProductVersion": "無法取得", "AntivirusEnabled": "未知"}]
@@ -353,43 +378,57 @@ ConvertTo-Json
 
 def get_installed_programs():
     data = []
-    registry_paths = [
+    uninstall_paths = [
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
     ]
-    hives = [
-        (winreg.HKEY_LOCAL_MACHINE, "HKLM"),
-        (winreg.HKEY_CURRENT_USER,  "HKCU"),
-    ]
+    # 機器層級 + 所有實際使用者的 hive（HKU\<SID>）。
+    # UAC 提權後 HKCU 指向管理員 hive，會漏掉實際登入者的 per-user 安裝，故改列舉 HKU。
+    roots = [(winreg.HKEY_LOCAL_MACHINE, p) for p in uninstall_paths]
+    try:
+        with winreg.OpenKey(winreg.HKEY_USERS, "") as users_key:
+            for i in range(winreg.QueryInfoKey(users_key)[0]):
+                sid = winreg.EnumKey(users_key, i)
+                if sid == ".DEFAULT" or sid.endswith("_Classes"):
+                    continue
+                for p in uninstall_paths:
+                    roots.append((winreg.HKEY_USERS, f"{sid}\\{p}"))
+    except OSError:
+        pass
+
     seen = set()
-    for hive, _ in hives:
-        for path in registry_paths:
-            try:
-                with winreg.OpenKey(hive, path) as reg_key:
-                    for i in range(winreg.QueryInfoKey(reg_key)[0]):
-                        subkey_name = winreg.EnumKey(reg_key, i)
-                        try:
-                            with winreg.OpenKey(reg_key, subkey_name) as subkey:
-                                display_name = _get_reg_value(subkey, "DisplayName")
-                                if not display_name:
-                                    continue
-                                display_version  = _get_reg_value(subkey, "DisplayVersion")  or ""
-                                publisher        = _get_reg_value(subkey, "Publisher")        or ""
-                                install_location = _get_reg_value(subkey, "InstallLocation") or ""
-                                key = (display_name, display_version)
-                                if key in seen:
-                                    continue
-                                seen.add(key)
-                                data.append({
-                                    "名稱": display_name,
-                                    "版本": display_version,
-                                    "發行者": publisher,
-                                    "安裝路徑": install_location,
-                                })
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+    for hive, path in roots:
+        try:
+            with winreg.OpenKey(hive, path) as reg_key:
+                for i in range(winreg.QueryInfoKey(reg_key)[0]):
+                    subkey_name = winreg.EnumKey(reg_key, i)
+                    try:
+                        with winreg.OpenKey(reg_key, subkey_name) as subkey:
+                            display_name = _get_reg_value(subkey, "DisplayName")
+                            if not display_name:
+                                continue
+                            # 過濾系統元件與 KB 更新（降低管理平台弱點比對的雜訊/誤判）
+                            if _get_reg_value(subkey, "SystemComponent") == 1:
+                                continue
+                            if _get_reg_value(subkey, "ParentKeyName"):
+                                continue
+                            display_version  = _get_reg_value(subkey, "DisplayVersion")  or ""
+                            publisher        = _get_reg_value(subkey, "Publisher")        or ""
+                            install_location = _get_reg_value(subkey, "InstallLocation") or ""
+                            key = (display_name, display_version)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            data.append({
+                                "名稱": display_name,
+                                "版本": display_version,
+                                "發行者": publisher,
+                                "安裝路徑": install_location,
+                            })
+                    except OSError:
+                        pass
+        except OSError:
+            pass
     return data
 
 
@@ -398,6 +437,95 @@ def _get_reg_value(key, value_name):
         return winreg.QueryValueEx(key, value_name)[0]
     except Exception:
         return None
+
+
+# 控制字元（XLSX/openpyxl 會對這些字元丟 IllegalCharacterError；HTML 也不該出現）
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _sanitize_text(s):
+    """移除控制字元，避免 XLSX 產生失敗或 HTML 亂碼。非字串原樣回傳。"""
+    if isinstance(s, str):
+        return _CTRL_RE.sub("", s)
+    return s
+
+
+def _parse_ps_date(val):
+    """解析 PowerShell/WMI 日期為 datetime；無法解析回 None。
+    支援 /Date(1789247217000)/（epoch 毫秒，可帶時區位移）、ISO、常見在地化格式。"""
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+    m = re.search(r"/Date\((-?\d+)", s)
+    if m:
+        try:
+            return datetime.datetime.fromtimestamp(int(m.group(1)) / 1000)
+        except (ValueError, OverflowError, OSError):
+            return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S",
+                "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.datetime.strptime(s[:19], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _format_os_version(major, minor, build, ubr):
+    """組成 <major>.<minor>.<build>[.<ubr>]；缺 UBR 時省略最後一段。"""
+    core = f"{major}.{minor}.{build}"
+    return f"{core}.{ubr}" if ubr is not None else core
+
+
+def _get_os_version_registry():
+    """自登錄檔取得語系中立、含 UBR 的 OS 版本資訊；失敗回 None。
+    Win11 的 ProductName 仍寫 'Windows 10'，勿用於區分 10/11（由 build 判定）。"""
+    path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as k:
+            build = str(_get_reg_value(k, "CurrentBuildNumber") or "").strip()
+            if not build.isdigit():
+                return None
+            ubr_raw = _get_reg_value(k, "UBR")
+            ubr = int(ubr_raw) if isinstance(ubr_raw, int) else None
+            major = _get_reg_value(k, "CurrentMajorVersionNumber")
+            minor = _get_reg_value(k, "CurrentMinorVersionNumber")
+            major = int(major) if isinstance(major, int) else 10
+            minor = int(minor) if isinstance(minor, int) else 0
+            disp = (_get_reg_value(k, "DisplayVersion")
+                    or _get_reg_value(k, "ReleaseId") or "")
+            product = _get_reg_value(k, "ProductName") or ""
+            return {
+                "os_version": _format_os_version(major, minor, int(build), ubr),
+                "ubr": ubr,
+                "display_version": str(disp),
+                "product_name": str(product),
+            }
+    except OSError:
+        return None
+
+
+def _safe(label, fn, default=None):
+    """呼叫單一收集器，失敗不中斷整體流程（保證一定產出 zip）。"""
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001
+        _print(f"    [警告] {label} 收集失敗：{type(e).__name__}: {e}")
+        return [] if default is None else default
+
+
+def _output_dir():
+    """輸出位置：凍結成 exe 時用 exe 所在目錄，否則腳本目錄；皆不可用時退回 CWD。
+    （UAC 提權後 CWD 常為 System32，使用者會找不到 zip。）"""
+    import sys
+    try:
+        if getattr(sys, "frozen", False):
+            return os.path.dirname(os.path.abspath(sys.executable))
+        return os.path.dirname(os.path.abspath(__file__))
+    except Exception:
+        return os.getcwd()
 
 
 def get_local_user_accounts():
@@ -570,9 +698,13 @@ ForEach-Object {
             data = [data]
         result = []
         for item in data:
+            sha = (item.get("SHA256", "") or "")
+            # 一律小寫（Get-FileHash 回大寫）；「無法計算」等非雜湊字串原樣保留
+            if re.fullmatch(r"[0-9A-Fa-f]{64}", sha):
+                sha = sha.lower()
             result.append({
                 "執行路徑": item.get("執行路徑", "") or "",
-                "SHA256":   item.get("SHA256",   "") or "",
+                "SHA256":   sha,
             })
         return result
     except Exception:
@@ -691,7 +823,8 @@ def get_startup_items():
 def get_netstat():
     ps_cmd = r"""
 $pidMap = @{}
-Get-Process | ForEach-Object { $pidMap[$_.Id] = $_.Name }
+# 用 Win32_Process 的 Name（含 .exe），與「執行中程序」一致，供管理平台以名稱關聯
+Get-CimInstance Win32_Process | ForEach-Object { $pidMap[[int]$_.ProcessId] = $_.Name }
 $result = @()
 netstat -ano | Select-String "^\s+(TCP|UDP)" | ForEach-Object {
     $parts = ($_ -replace "^\s+","") -split "\s+"
@@ -1393,9 +1526,9 @@ def _analyze_defender(defender_info, programs=None):
             ))
 
     last_updated = info.get("AntivirusSignatureLastUpdated", "") or ""
-    if last_updated:
+    updated_dt = _parse_ps_date(last_updated)
+    if updated_dt is not None:
         try:
-            updated_dt = datetime.datetime.strptime(last_updated[:19], "%Y-%m-%d %H:%M:%S")
             days = (datetime.datetime.now() - updated_dt).days
             if days > 30:
                 findings.append(_finding(
@@ -1726,7 +1859,7 @@ def generate_html(computer_name, local_ip, report_data, findings, risk_score, ri
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>H2C PC 健診 — {computer_name} ({local_ip})</title>
+<title>H2C PC 健診 — {html.escape(str(computer_name))} ({html.escape(str(local_ip))})</title>
 <style>{_CSS}</style>
 </head>
 <body>
@@ -1737,8 +1870,8 @@ def generate_html(computer_name, local_ip, report_data, findings, risk_score, ri
 <div class="container">
   <h1>PC 資安健診報告</h1>
   <p class="meta-line">
-    電腦：<strong>{computer_name}</strong> &nbsp;|&nbsp;
-    IP：<strong>{local_ip}</strong> &nbsp;|&nbsp;
+    電腦：<strong>{html.escape(str(computer_name))}</strong> &nbsp;|&nbsp;
+    IP：<strong>{html.escape(str(local_ip))}</strong> &nbsp;|&nbsp;
     產生時間：{now_str}
   </p>
 
@@ -1788,11 +1921,14 @@ def generate_html(computer_name, local_ip, report_data, findings, risk_score, ri
 # XLSX 產生
 # ─────────────────────────────────────────────────────────────────────────────
 def _safe_cell(val):
-    """防止 Excel 公式注入：以 =+-@ 開頭的字串加前置 ' 號。"""
-    s = str(val) if not isinstance(val, (int, float, type(None))) else val
-    if isinstance(s, str) and s and s[0] in ("=", "+", "-", "@", "|", "%"):
+    """防 Excel 公式注入（=+-@ 開頭字串加 '）並移除控制字元（避免 openpyxl 崩潰）。
+    數值型別（int/float）原樣回傳，不會被誤加前綴。"""
+    if isinstance(val, (int, float, type(None))):
+        return val
+    s = _sanitize_text(str(val))
+    if s and s[0] in ("=", "+", "-", "@", "|", "%"):
         return "'" + s
-    return val
+    return s
 
 
 def _write_sheet(ws, data, field_order=None):
@@ -1882,13 +2018,20 @@ def package_zip(base_name, report_data, findings, risk_score, risk_level,
         findings_with_id.append(entry)
     findings_json_bytes = json.dumps(findings_with_id, ensure_ascii=False, indent=2).encode("utf-8")
 
-    html_bytes = generate_html(
-        computer_name, local_ip, report_data, findings, risk_score, risk_level,
-    ).encode("utf-8")
+    try:
+        html_bytes = generate_html(
+            computer_name, local_ip, report_data, findings, risk_score, risk_level,
+        ).encode("utf-8")
+    except Exception as e:  # noqa: BLE001 — HTML 失敗不應影響 json/zip 產出
+        html_bytes = f"<html><body>HTML 報告產生失敗：{html.escape(str(e))}</body></html>".encode("utf-8")
 
-    buf = io.BytesIO()
-    generate_xlsx(report_data, findings).save(buf)
-    xlsx_bytes = buf.getvalue()
+    try:
+        buf = io.BytesIO()
+        generate_xlsx(report_data, findings).save(buf)
+        xlsx_bytes = buf.getvalue()
+    except Exception as e:  # noqa: BLE001 — XLSX 失敗不應影響 json/zip 產出
+        _print(f"    [警告] XLSX 產生失敗，略過：{type(e).__name__}: {e}")
+        xlsx_bytes = None
 
     meta = {
         "tool":          "H2C_PcSecCheck",
@@ -1913,15 +2056,18 @@ def package_zip(base_name, report_data, findings, risk_score, risk_level,
     }
     meta_json_bytes = json.dumps(meta, ensure_ascii=False, indent=2).encode("utf-8")
 
-    zip_filename = f"{base_name}.h2cpc.zip"
-    with zipfile.ZipFile(zip_filename, "w", zipfile.ZIP_DEFLATED) as zf:
+    # 檔名 ASCII-safe（主機名含特殊字元時避免寫到非預期路徑）；zip 內部維持原 base_name
+    safe_base = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name).strip("_") or "h2cpc"
+    zip_path = os.path.join(_output_dir(), f"{safe_base}.h2cpc.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("meta.json",                      meta_json_bytes)
         zf.writestr(f"{base_name}.report.json",   report_json_bytes)
         zf.writestr(f"{base_name}.findings.json", findings_json_bytes)
         zf.writestr(f"{base_name}.report.html",   html_bytes)
-        zf.writestr(f"{base_name}.report.xlsx",   xlsx_bytes)
+        if xlsx_bytes is not None:
+            zf.writestr(f"{base_name}.report.xlsx",   xlsx_bytes)
 
-    return zip_filename
+    return zip_path
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1956,43 +2102,43 @@ def main():
     zip_filename = f"{base_name}.h2cpc.zip"
 
     _print("=" * 56)
-    _print("  H2C PC 資安健診工具  v2.0")
+    _print(f"  H2C PC 資安健診工具  v{TOOL_VERSION}")
     _print(f"  電腦：{computer_name}   IP：{local_ip}")
     _print("=" * 56)
     _print("")
 
     _print("[1/16] 取得系統資訊...")
-    system_info      = get_system_info()
+    system_info      = _safe("系統資訊", get_system_info)
     _print("[2/16] 取得 Windows Defender 資訊...")
-    defender_info    = get_defender_info()
+    defender_info    = _safe("Windows Defender", get_defender_info)
     _print("[3/16] 取得已安裝更新...")
-    updates          = get_installed_updates()
+    updates          = _safe("已安裝更新", get_installed_updates)
     _print("[4/16] 取得已安裝程式...")
-    programs         = get_installed_programs()
+    programs         = _safe("已安裝程式", get_installed_programs)
     _print("[5/16] 取得使用者帳號...")
-    user_accounts    = get_local_user_accounts()
+    user_accounts    = _safe("使用者帳號", get_local_user_accounts)
     _print("[6/16] 取得密碼原則...")
-    password_policy  = get_password_policy()
+    password_policy  = _safe("密碼原則", get_password_policy)
     _print("[7/16] 取得網路設定...")
-    network_settings = get_network_settings()
+    network_settings = _safe("網路設定", get_network_settings)
     _print("[8/16] 取得啟動項目...")
-    startup_items    = get_startup_items()
+    startup_items    = _safe("啟動項目", get_startup_items)
     _print("[9/16] 取得執行中程序...")
-    processes        = get_processes()
+    processes        = _safe("執行中程序", get_processes)
     _print("[10/16] 計算程序 SHA256 雜湊值 (需要一些時間)...")
-    process_hashes   = get_process_hashes()
+    process_hashes   = _safe("程序雜湊", get_process_hashes)
     _print("[11/16] 取得網路連線狀態...")
-    netstat          = get_netstat()
+    netstat          = _safe("網路連線", get_netstat)
     _print("[12/16] 取得防火牆狀態...")
-    firewall         = get_firewall_status()
+    firewall         = _safe("防火牆狀態", get_firewall_status)
     _print("[13/16] 取得 SMB 設定...")
-    smb              = get_smb_status()
+    smb              = _safe("SMB 設定", get_smb_status)
     _print("[14/16] 取得共用資料夾...")
-    shared_folders   = get_shared_folders()
+    shared_folders   = _safe("共用資料夾", get_shared_folders)
     _print("[15/16] 取得稽核原則...")
-    audit_policy     = get_audit_policy()
+    audit_policy     = _safe("稽核原則", get_audit_policy)
     _print("[16/16] 讀取 hosts 檔案...")
-    hosts_file       = get_hosts_file()
+    hosts_file       = _safe("Hosts 檔案", get_hosts_file)
 
     report_data = {
         "meta": {
