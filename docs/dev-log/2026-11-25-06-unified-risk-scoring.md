@@ -11,11 +11,13 @@
 - 公式：基礎分 40/20/8/2/0 → 啟發式類別降權（0.6 / 0.8）→ 同類 0.5 遞減 →
   `100 × (1 − e^(−R/50))` → 等級依最高嚴重度上下限約束。細節見 README「風險評分」。
 - `meta.json` 加 `scoring_ver: 2`；報告與 console 的分數標示為「初步評分」。
+- 審查後修正（1206609）：計分不再重複套用 EPSS 嚴重度升級（VANS 建立 CVE finding 時已升過級），
+  新增 `scored_severity()`，只確保 KEV → 4。client 本機 finding 沒有 EPSS，分數不受影響。
 - Windows 版 `TOOL_VERSION` 2.1.0 → 2.2.0（`version.txt` 維持專案慣例不逐次 bump）。
 
 ## 驗證
 
-- `tests/test_scoring.py`：22 項，含 6 台 pilot 主機的去識別化摘要（`tests/fixtures/scoring_pilot_hosts.json`，
+- `tests/test_scoring.py`：23 項，含 6 台 pilot 主機的去識別化摘要（`tests/fixtures/scoring_pilot_hosts.json`，
   只有 category / severity / 筆數）鎖定新分數：89 critical、79 / 78 / 71 high、51 / 51 medium。
 - `tests/test_win_pure.py` 的 `calculate_risk` 測試已改為新期望值；此檔需在 Windows 執行（`winreg`）。
 - Linux / macOS 腳本可正常 import 並呼叫 `calculate_risk()`。
