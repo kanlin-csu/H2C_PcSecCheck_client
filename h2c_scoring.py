@@ -21,7 +21,9 @@
 公式（2026-11-25「風險計分改版提案」）：
 
 1. 每筆 finding 基礎分 P：Critical 40 / High 20 / Medium 8 / Low 2 / Info 0。
-   有效嚴重度：KEV → 4；EPSS ≥ 0.5 → +1（上限 4）。
+   finding 的 severity 視為**已調整後**的嚴重度（VANS 在建立 CVE finding 時已套用
+   effective_severity：KEV → 4、EPSS ≥ 0.5 → +1）；計分時只再確保 KEV → 4（冪等），
+   不重複做 EPSS 升級。
    修正：KEV ×1.5、×(1+EPSS)、對外服務 ×1.25、
    類別信心係數（啟發式規則 0.6 / 0.8）、可信度 probable ×0.6。
 2. 同類遞減：同一 group（CVE 為同一套軟體，其餘為 category）內
@@ -91,11 +93,20 @@ def effective_severity(severity, kev: bool = False, epss: float | None = None) -
     return sev
 
 
+def scored_severity(f: dict) -> int:
+    """計分用嚴重度：沿用 finding 已存的 severity，只做 KEV → 4（冪等）。
+
+    EPSS 升級屬於建立 finding 時的工作（effective_severity），不可在此重複套用，
+    否則 EPSS ≥ 0.5 的 Medium 會被升兩級。
+    """
+    return effective_severity(f.get("severity"), bool(f.get("kev")), None)
+
+
 def finding_points(f: dict) -> float:
     """單筆 finding 的基礎分 P（已含所有修正係數，未含同類遞減）。"""
     kev = bool(f.get("kev"))
     epss = f.get("epss")
-    p = SEVERITY_POINTS[effective_severity(f.get("severity"), kev, epss)]
+    p = SEVERITY_POINTS[scored_severity(f)]
     if kev:
         p *= KEV_MULTIPLIER
     if epss:
@@ -155,6 +166,5 @@ def host_score(findings: list[dict], criticality: str = "medium") -> tuple[int, 
         return 0, "info"
     r, _ = raw_risk(active, criticality)
     score = score_from_raw(r)
-    max_sev = max(effective_severity(f.get("severity"), bool(f.get("kev")), f.get("epss"))
-                  for f in active)
+    max_sev = max(scored_severity(f) for f in active)
     return score, level_for(score, max_sev)

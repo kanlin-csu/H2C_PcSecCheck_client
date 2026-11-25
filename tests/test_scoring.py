@@ -81,8 +81,15 @@ def test_probable_and_modifiers():
     assert sc.finding_points(_f(3, internet_facing=True)) == pytest.approx(25)
     # KEV → 有效嚴重度 4，再 ×1.5
     assert sc.finding_points(_f(1, kev=True)) == pytest.approx(60)
-    # EPSS ≥ 0.5 → +1 級，再 ×(1+EPSS)
-    assert sc.finding_points(_f(2, epss=0.5)) == pytest.approx(20 * 1.5)
+    # EPSS 只乘 ×(1+EPSS)，不再升級：severity 已由建立 finding 時調整過
+    assert sc.finding_points(_f(2, epss=0.5)) == pytest.approx(8 * 1.5)
+
+
+def test_epss_promotion_not_applied_twice():
+    """VANS 已把 EPSS ≥ 0.5 的 Medium 存成 High；計分不可再升成 Critical。"""
+    stored_high = _f(3, "vulnerable_software", epss=0.6, group="sw:x:1")
+    assert sc.scored_severity(stored_high) == 3
+    assert sc.host_score([stored_high])[1] == "medium"
 
 
 def test_criticality_scales_raw():
