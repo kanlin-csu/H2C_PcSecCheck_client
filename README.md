@@ -128,8 +128,18 @@ Windows 版需以**系統管理員（Administrator）** 身份執行，Linux / m
 | `audit_policy` | 登入 / 物件存取 / 特殊登入未啟用稽核 | Medium |
 | `hosts_file` | Hosts 檔案含非標準條目 | Medium |
 
-風險評分：severity 4 → 40 分 / 3 → 20 分 / 2 → 10 分 / 1 → 3 分，上限 100。  
-對應等級：low（< 20）/ medium（20–49）/ high（50–79）/ critical（≥ 80）
+### 風險評分（scoring v2，與 VANS 共用 `h2c_scoring.py`）
+
+報告上的分數是**初步評分**（只含本機規則）；上傳 VANS 後會再加入 CVE / 情資 findings，以同一套公式重算正式分數。
+
+1. 每筆 finding 基礎分：Critical 40 / High 20 / Medium 8 / Low 2 / Info 0。
+   啟發式規則降權：`suspicious_connection`、`open_port`、`account_anomaly` 等 × 0.6，`suspicious_process`、`suspicious_startup` × 0.8。
+2. **同類遞減**：同一類別內依分數由高到低，第 i 筆 × 0.5^(i-1)。同類再多筆，合計不超過最高那筆的 2 倍（避免 100 筆連線灌滿分數）。
+3. 分數 = round(100 × (1 − e^(−R/50)))，R 為各類別分加總。
+4. 等級：critical ≥ 80 / high ≥ 60 / medium ≥ 30 / low ≥ 10 / 其餘 info，再依最高嚴重度約束：
+   有 Critical 至少 high、有 High 至少 medium；沒有 Critical 最多 high、最高只到 Medium 時最多 medium。
+
+`meta.json` 帶 `scoring_ver`（目前為 2）。
 
 ---
 
@@ -187,6 +197,8 @@ Linux 版目前提供原始 Python 腳本：
 sudo python3 H2C_PcSecCheck_linux.py
 ```
 
+> 腳本需與同目錄的 `h2c_scoring.py`（共用計分模組）一起複製到受測主機。
+
 建議以 `sudo` 執行，否則部分資訊（如程序 exe、auditd 規則、iptables、密碼期限）可能無法完整讀取。
 
 Linux 版報告會在最上方產生 **「行政院資安健診重點摘要」**，以 `PASS` / `WARN` / `FAIL` / `INFO` 標示重點項目，例如：
@@ -220,6 +232,8 @@ macOS 版目前提供原始 Python 腳本：
 ```bash
 sudo python3 H2C_PcSecCheck_macos.py
 ```
+
+> 腳本需與同目錄的 `h2c_scoring.py`（共用計分模組）一起複製到受測主機。
 
 建議以 `sudo` 執行，否則部分系統安全設定、程序路徑、網路連線與稽核資訊可能無法完整讀取。
 
@@ -301,5 +315,5 @@ You may obtain a copy of the License at
 |------|------|
 | 開發單位 | H2C 工作室 |
 | 開發者 | 甘霖老師 |
-| 版本 | v2.1.0 |
+| 版本 | v2.2.0 |
 | 授權 | Apache License 2.0 |

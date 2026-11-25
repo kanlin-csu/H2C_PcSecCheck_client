@@ -80,15 +80,14 @@ def _f(sev):
 
 
 def test_calculate_risk_levels():
-    assert m.calculate_risk([])[1] == "low"
-    # severity 4 → 40 分 → medium(20-49)
-    score, level = m.calculate_risk([_f(4)])
-    assert score == 40 and level == "medium"
-    # 兩個 critical = 80 → critical(>=80)
-    score, level = m.calculate_risk([_f(4), _f(4)])
-    assert score == 80 and level == "critical"
+    # 計分委派共用模組 h2c_scoring（scoring v2），細節見 tests/test_scoring.py
+    assert m.calculate_risk([]) == (0, "info")
+    # 單一 critical：55 分，等級下限 high
+    assert m.calculate_risk([_f(4)]) == (55, "high")
+    # 同類兩個 critical：R = 40 + 20 = 60 → 70 分
+    assert m.calculate_risk([_f(4), _f(4)]) == (70, "high")
 
 
-def test_calculate_risk_capped_at_100():
-    score, level = m.calculate_risk([_f(4)] * 10)
-    assert score == 100 and level == "critical"
+def test_calculate_risk_same_category_does_not_saturate():
+    # 舊公式 10 個 critical 即 100；新公式同類遞減，合計不超過最高那筆的 2 倍
+    assert m.calculate_risk([_f(4)] * 10) == (80, "critical")

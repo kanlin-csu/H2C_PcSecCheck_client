@@ -36,7 +36,9 @@ import hashlib
 import datetime
 from openpyxl import Workbook
 
-TOOL_VERSION = "2.1.0"
+from h2c_scoring import SCORING_VERSION, host_score  # 與 VANS 共用的計分模組
+
+TOOL_VERSION = "2.2.0"
 SCHEMA_VERSION = "2"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,7 +174,7 @@ SEVERITY_COLOR = {
 }
 RISK_COLORS = {
     "critical": "#dc3545", "high": "#fd7e14",
-    "medium":   "#ffc107", "low":  "#198754",
+    "medium":   "#ffc107", "low":  "#198754", "info": "#6c757d",
 }
 
 
@@ -1662,14 +1664,11 @@ def analyze_findings(report_data):
 
 
 def calculate_risk(findings):
-    SEV_SCORE = {4: 40, 3: 20, 2: 10, 1: 3, 0: 0}
-    total = sum(SEV_SCORE.get(f.get("severity", 0), 0) for f in findings)
-    score = min(100, total)
-    if   score >= 80: level = "critical"
-    elif score >= 50: level = "high"
-    elif score >= 20: level = "medium"
-    else:             level = "low"
-    return score, level
+    """主機初步風險（0–100, 等級）——委派共用計分模組 h2c_scoring（scoring v2）。
+
+    與 VANS 同一套公式；VANS 會再加入 CVE / 情資 findings 重算正式分數。
+    """
+    return host_score(findings)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1877,7 +1876,7 @@ def generate_html(computer_name, local_ip, report_data, findings, risk_score, ri
 
   <div class="card" id="findings_sec">
     <div class="card-header">
-      風險摘要
+      風險摘要（初步評分：僅本機規則，正式分數以 VANS 為準）
       <span class="badge" style="background:{risk_color};font-size:13px;padding:4px 14px">
         {risk_level.upper()} &nbsp; {risk_score}/100
       </span>
@@ -2037,6 +2036,7 @@ def package_zip(base_name, report_data, findings, risk_score, risk_level,
         "tool":          "H2C_PcSecCheck",
         "version":       TOOL_VERSION,
         "schema_ver":    SCHEMA_VERSION,
+        "scoring_ver":   SCORING_VERSION,
         "computer_name": computer_name,
         "local_ip":      local_ip,
         "generated_at":  now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2182,7 +2182,7 @@ def main():
     _print("")
     _print("=" * 56)
     _print(f"  完成！輸出：{zip_file}")
-    _print(f"  風險等級：{risk_level.upper()} ({risk_score}/100)")
+    _print(f"  初步風險等級：{risk_level.upper()} ({risk_score}/100)")
     for sev, label in [(4, "Critical"), (3, "High"), (2, "Medium"), (1, "Low"), (0, "Info")]:
         cnt = sum(1 for f in findings if f.get("severity") == sev)
         if cnt:
