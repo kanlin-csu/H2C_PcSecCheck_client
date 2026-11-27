@@ -72,14 +72,14 @@ Windows 版需以**系統管理員（Administrator）** 身份執行，Linux / m
 | 類別 | 收集內容 |
 |------|---------|
 | 系統資訊 | hostname、IP、OS release、Kernel、CPU、記憶體、uptime |
-| 修補 / 更新狀態 | `apt` / `dnf` / `yum` 可更新套件數與前幾筆套件 |
+| 修補 / 更新狀態 | 從 `apt` / `dnf` / `yum` 本機套件索引列出可更新套件 |
 | 防毒 / 端點防護 | ClamAV、rkhunter、chkrootkit、AIDE、Tripwire、Lynis 偵測 |
 | 套件清單 | `dpkg -l` 或 `rpm -qa` 已安裝套件 |
 | 帳號與權限 | `/etc/passwd`、一般帳號、系統帳號、shell、最後登入、密碼期限 |
 | 特權帳號 | UID 0、sudo / wheel / admin 群組 |
 | 密碼 / PAM 原則 | `/etc/login.defs`、`/etc/security/pwquality.conf` |
 | SSH 安全設定 | root login、password authentication、empty password、MaxAuthTries |
-| 防火牆 | ufw、firewalld、iptables 狀態 |
+| 防火牆 | ufw、firewalld、nftables、iptables / ip6tables 狀態與預設政策 |
 | 對外監聽服務 | `ss` / `netstat` 監聽與連線狀態 |
 | 啟動服務與排程 | systemd enabled services、crontab、`/etc/cron.*`、`/etc/rc.local` |
 | 稽核與日誌 | auditd、auditctl 規則檢查 |
@@ -201,7 +201,7 @@ sudo python3 H2C_PcSecCheck_linux.py
 
 建議以 `sudo` 執行，否則部分資訊（如程序 exe、auditd 規則、iptables、密碼期限）可能無法完整讀取。
 
-Linux 版報告會在最上方產生 **「行政院資安健診重點摘要」**，以 `PASS` / `WARN` / `FAIL` / `INFO` 標示重點項目，例如：
+Linux 版報告會在最上方產生 **「行政院資安健診重點摘要」**。收集失敗或資料不足的項目顯示 `UNKNOWN`，並列於報告首頁。防火牆檢查涵蓋 ufw、firewalld、nftables、iptables 和 ip6tables。更新檢查只查本機套件索引，零筆更新會標為 `INFO`，實際修補狀態須依索引更新時間判讀。
 
 | 重點項目 | 說明 |
 |---------|------|

@@ -19,18 +19,21 @@ limitations under the License.
 """
 from __future__ import annotations
 
-import grp
 import html
 import io
+import ipaddress
 import os
 import re
-import socket
+import shlex
 import subprocess
 import json
 import platform
 import zipfile
 import hashlib
 import datetime
+from dataclasses import dataclass
+from functools import partial
+
 from openpyxl import Workbook
 
 from h2c_scoring import SCORING_VERSION, host_score  # 與 VANS 共用的計分模組
@@ -84,18 +87,37 @@ RISK_COLORS = {
 # ─────────────────────────────────────────────────────────────────────────────
 # 工具函式
 # ─────────────────────────────────────────────────────────────────────────────
-def _run(cmd: list[str], timeout: int = 15, stdin_input: str | None = None) -> str:
-    """執行系統指令，回傳 stdout 字串；失敗回傳空字串。"""
+
+@dataclass
+class CommandResult:
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int | None = None
+    missing: bool = False
+
+
+def _command(cmd: list[str], timeout: int = 15, stdin_input: str | None = None) -> CommandResult:
+    env = os.environ.copy()
+    for name in ("DBUS_SYSTEM_BUS_ADDRESS", "DBUS_SESSION_BUS_ADDRESS", "SYSTEMD_BUS_ADDRESS",
+                 "DOCKER_CONTEXT", "DOCKER_HOST", "CONTAINER_HOST", "CONTAINER_CONNECTION"):
+        env.pop(name, None)
+    env["LC_ALL"] = "C"
     try:
-        r = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-            input=stdin_input,
-        )
-        return r.stdout or ""
+        result = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace",
+                                timeout=timeout, input=stdin_input, env=env)
+        return CommandResult(result.stdout, result.stderr, result.returncode)
     except FileNotFoundError:
-        return ""
-    except Exception:
-        return ""
+        return CommandResult(stderr="找不到指令", missing=True)
+    except subprocess.TimeoutExpired:
+        return CommandResult(stderr="指令逾時")
+    except OSError as exc:
+        return CommandResult(stderr=str(exc))
+
+
+def _run(cmd: list[str], timeout: int = 15, stdin_input: str | None = None,
+         ok_codes: tuple[int, ...] = (0,)) -> str:
+    result = _command(cmd, timeout=timeout, stdin_input=stdin_input)
+    return result.stdout if result.returncode in ok_codes else ""
 
 
 def _is_private_ip(ip: str) -> bool:
@@ -103,43 +125,23 @@ def _is_private_ip(ip: str) -> bool:
     return any(p.match(ip) for p in _PRIVATE_NETS)
 
 
+
 def get_local_ip_address() -> str:
-    # 方法一：問核心路由表，不需要真的連上外網；無預設路由時可能失敗。
-    out = _run(["ip", "-4", "route", "get", "1.1.1.1"], timeout=5)
-    m = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)\b", out)
-    if m and not m.group(1).startswith("127."):
-        return m.group(1)
-
-    # 方法二：hostname -I，適合沒有外網但有內網 IP 的主機。
-    out = _run(["hostname", "-I"], timeout=5)
-    for token in out.split():
-        if re.match(r"^\d+\.\d+\.\d+\.\d+$", token) and not token.startswith("127."):
-            return token
-
-    # 方法三：掃描 ip addr 的 IPv4 位址。
-    out = _run(["ip", "-4", "addr", "show", "scope", "global"], timeout=5)
-    for line in out.splitlines():
-        m = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/", line)
-        if m and not m.group(1).startswith("127."):
-            return m.group(1)
-
-    # 方法四：建立 UDP socket 取得本機來源 IP。
-    try:
-        with socket.create_connection(("8.8.8.8", 80), timeout=3) as s:
-            ip = s.getsockname()[0]
-            if ip and not ip.startswith("127."):
-                return ip
-    except Exception:
-        pass
-
-    # 方法五：hostname DNS 解析。
-    try:
-        for addr_info in socket.getaddrinfo(socket.gethostname(), None):
-            ip = addr_info[4][0]
-            if ":" not in ip and not ip.startswith("127."):
-                return ip
-    except Exception:
-        pass
+    route = _run(["ip", "-4", "route", "show", "default"], timeout=5)
+    match = re.search(r"\bdev\s+(\S+)", route)
+    address_cmd = ["ip", "-4", "-o", "addr", "show", "scope", "global"]
+    commands = [address_cmd + ["dev", match[1]]] if match else []
+    commands += [address_cmd, ["hostname", "-I"]]
+    for cmd in commands:
+        out = _run(cmd, timeout=5)
+        addresses = out.split() if cmd[0] == "hostname" else re.findall(r"\binet\s+(\S+)/\d+", out)
+        for value in addresses:
+            try:
+                address = ipaddress.IPv4Address(value)
+            except ValueError:
+                continue
+            if not address.is_loopback and not address.is_unspecified:
+                return str(address)
     return "未知"
 
 
@@ -213,22 +215,24 @@ def get_av_status() -> list[dict]:
         (["lynis", "show", "version"],"Lynis"),
     ]
     for cmd, name in checks:
-        out = _run(cmd, timeout=5)
-        if out.strip():
-            # 嘗試取版本號第一行
-            ver = out.strip().splitlines()[0][:80]
-            # 檢查 systemd 服務狀態
-            svc_map = {"ClamAV": "clamav-daemon", "rkhunter": "rkhunter"}
-            svc_status = ""
-            if name in svc_map:
-                svc_out = _run(["systemctl", "is-active", svc_map[name]], timeout=5).strip()
-                svc_status = "啟用（running）" if svc_out == "active" else f"停用（{svc_out}）"
-            tools.append({
-                "工具":     name,
-                "版本":     ver,
-                "狀態":     "已安裝",
-                "即時保護": svc_status or "N/A",
-            })
+        probe = _command(cmd, timeout=5)
+        if probe.missing:
+            continue
+        out = probe.stdout.strip()
+        if probe.returncode != 0 or not out:
+            tools.append({"工具": name, "版本": "", "狀態": "無法取得", "即時保護": ""})
+            continue
+        svc_map = {"ClamAV": "clamav-daemon", "rkhunter": "rkhunter"}
+        svc_status = "N/A"
+        if name in svc_map:
+            svc_out = _run(["systemctl", "is-active", svc_map[name]], timeout=5, ok_codes=(0, 3, 4)).strip()
+            if svc_out == "active":
+                svc_status = "啟用（running）"
+            elif svc_out in ("inactive", "failed"):
+                svc_status = f"停用（{svc_out}）"
+            else:
+                svc_status = "無法取得"
+        tools.append({"工具": name, "版本": out.splitlines()[0][:80], "狀態": "已安裝", "即時保護": svc_status})
 
     if not tools:
         tools.append({
@@ -288,6 +292,7 @@ def get_local_user_accounts() -> list[dict]:
         "/usr/bin/nologin", "/bin/nologin",
     }
 
+    groups = {gid: name for name, gid, _ in _local_groups()}
     try:
         with open("/etc/passwd") as f:
             for line in f:
@@ -303,10 +308,7 @@ def get_local_user_accounts() -> list[dict]:
                 enabled = shell not in no_login_shells
 
                 # 群組名稱
-                try:
-                    group_name = grp.getgrgid(gid).gr_name
-                except Exception:
-                    group_name = str(gid)
+                group_name = groups.get(str(gid), str(gid))
 
                 # 上次登入（lastlog）
                 last_logon = ""
@@ -344,11 +346,8 @@ def get_local_user_accounts() -> list[dict]:
                     "密碼到期":     pw_expires,
                     "所屬群組":     group_name,
                 })
-    except Exception as e:
-        result.append({
-            "帳號名稱": f"無法取得: {e}", "UID": "", "是否啟用": "",
-            "帳號類型": "", "描述": "", "Shell": "", "上次登入": "", "密碼到期": "", "所屬群組": "",
-        })
+    except OSError as exc:
+        raise RuntimeError("無法讀取本機帳號資料") from exc
     return result
 
 
@@ -365,13 +364,11 @@ def get_password_policy() -> list[dict]:
                 parts = line.split(None, 1)
                 if len(parts) == 2:
                     data.append({"設定": parts[0], "值": parts[1]})
-    except Exception as e:
-        data.append({"設定": "無法讀取 /etc/login.defs", "值": str(e)})
+    except OSError as exc:
+        raise RuntimeError("無法讀取 /etc/login.defs") from exc
 
     # pam pwquality
     for pam_path in ["/etc/security/pwquality.conf"]:
-        if not os.path.isfile(pam_path):
-            continue
         try:
             with open(pam_path) as f:
                 for line in f:
@@ -381,44 +378,57 @@ def get_password_policy() -> list[dict]:
                     if "=" in line:
                         k, v = line.split("=", 1)
                         data.append({"設定": f"[pwquality] {k.strip()}", "值": v.strip()})
-        except Exception:
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            raise RuntimeError(f"無法讀取 {pam_path}") from exc
 
     return data if data else [{"設定": "無法取得密碼原則", "值": ""}]
 
 
+
 def get_update_status() -> list[dict]:
-    """列出可更新套件數量與前幾筆套件，供健診摘要快速判讀。"""
-    result: list[dict] = []
+    """查詢本機套件索引。"""
+    commands = {
+        "apt": ["apt", "-o", "Dir::Cache::pkgcache=", "-o", "Dir::Cache::srcpkgcache=", "list", "--upgradable"],
+        "dnf": ["dnf", "--cacheonly", "--setopt=plugins=0", "--quiet", "check-update"],
+        "yum": ["yum", "--cacheonly", "--noplugins", "--quiet", "check-update"],
+    }
+    for manager, cmd in commands.items():
+        probe = _command(cmd, timeout=30)
+        if probe.missing:
+            continue
+        if probe.returncode not in ((0,) if manager == "apt" else (0, 100)):
+            raise RuntimeError(f"{manager} 本機套件索引查詢失敗")
+        rows = []
+        if manager == "apt":
+            rows = [line for line in probe.stdout.splitlines() if re.match(r"^\S+/\S*\s", line)]
+        elif probe.returncode == 100:
+            for line in probe.stdout.splitlines():
+                if line.startswith("Obsoleting"):
+                    break
+                if re.match(r"^\S+\.\S+\s+\S+\s+\S+\s*$", line):
+                    rows.append(line)
+            if not rows:
+                raise RuntimeError(f"{manager} 回報有更新，但無法解析套件清單")
+        return [
+            {"項目": "套件管理器", "內容": manager},
+            {"項目": "資料來源", "內容": "本機套件索引（未刷新）"},
+            {"項目": "可更新套件數", "內容": str(len(rows))},
+            *({"項目": "可更新套件", "內容": line} for line in rows[:30]),
+        ]
+    raise RuntimeError("找不到 apt、dnf 或 yum")
 
-    out = _run(["apt", "list", "--upgradable"], timeout=30)
-    if out:
-        rows = [line for line in out.splitlines() if "/" in line and not line.lower().startswith("listing")]
-        result.append({"項目": "套件管理器", "內容": "apt"})
-        result.append({"項目": "可更新套件數", "內容": str(len(rows))})
-        for line in rows[:30]:
-            result.append({"項目": "可更新套件", "內容": line})
-        return result
 
-    out = _run(["dnf", "check-update"], timeout=30)
-    if out:
-        rows = [line for line in out.splitlines() if line and not line.startswith(("Last metadata", "Obsoleting"))]
-        result.append({"項目": "套件管理器", "內容": "dnf"})
-        result.append({"項目": "可更新套件數", "內容": str(len(rows))})
-        for line in rows[:30]:
-            result.append({"項目": "可更新套件", "內容": line})
-        return result
-
-    out = _run(["yum", "check-update"], timeout=30)
-    if out:
-        rows = [line for line in out.splitlines() if line and not line.startswith(("Loaded plugins", "Obsoleting"))]
-        result.append({"項目": "套件管理器", "內容": "yum"})
-        result.append({"項目": "可更新套件數", "內容": str(len(rows))})
-        for line in rows[:30]:
-            result.append({"項目": "可更新套件", "內容": line})
-        return result
-
-    return [{"項目": "更新狀態", "內容": "無法取得（apt/dnf/yum 不可用或逾時）"}]
+def _local_groups() -> list[tuple[str, str, list[str]]]:
+    groups = []
+    with open("/etc/group", encoding="utf-8", errors="replace") as group_file:
+        for line in group_file:
+            fields = line.rstrip("\n").split(":")
+            if len(fields) == 4 and fields[2].isdigit():
+                name, _, gid, members = fields
+                groups.append((name, gid, members.split(",") if members else []))
+    return groups
 
 
 def get_privileged_accounts() -> list[dict]:
@@ -434,26 +444,22 @@ def get_privileged_accounts() -> list[dict]:
                         "UID": int(parts[2]) if parts[2].isdigit() else -1,
                         "Shell": parts[6],
                     }
-    except Exception:
-        pass
+    except OSError as exc:
+        raise RuntimeError("無法讀取本機特權帳號資料") from exc
 
     for name, info in passwd_users.items():
         if info["UID"] == 0:
             result.append({"帳號": name, "權限來源": "UID 0", "UID": info["UID"], "Shell": info["Shell"]})
 
-    for group_name in ("sudo", "wheel", "admin"):
-        try:
-            g = grp.getgrnam(group_name)
-            for member in g.gr_mem:
-                info = passwd_users.get(member, {})
-                result.append({
-                    "帳號": member,
-                    "權限來源": group_name,
-                    "UID": info.get("UID", ""),
-                    "Shell": info.get("Shell", ""),
-                })
-        except Exception:
+    for group_name, _, members in _local_groups():
+        if group_name not in ("sudo", "wheel", "admin"):
             continue
+        for member in members:
+            info = passwd_users.get(member, {})
+            result.append({
+                "帳號": member, "權限來源": group_name,
+                "UID": info.get("UID", ""), "Shell": info.get("Shell", ""),
+            })
 
     seen = set()
     dedup = []
@@ -481,30 +487,16 @@ def get_ssh_security() -> list[dict]:
         "allowgroups": "允許群組",
     }
 
-    out = _run(["sshd", "-T"], timeout=10)
-    parsed: dict[str, str] = {}
-    if out:
-        for line in out.splitlines():
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                parsed[parts[0].lower()] = parts[1].strip()
-    else:
-        for conf in ("/etc/ssh/sshd_config",):
-            if os.path.isfile(conf):
-                try:
-                    with open(conf) as f:
-                        for line in f:
-                            line = line.strip()
-                            if not line or line.startswith("#"):
-                                continue
-                            parts = line.split(None, 1)
-                            if len(parts) == 2:
-                                parsed[parts[0].lower()] = parts[1].strip()
-                except Exception:
-                    pass
-
-    if not parsed:
-        return [{"設定": "OpenSSH Server", "值": "未安裝或無法讀取 sshd_config", "狀態": "Info"}]
+    probe = _command(["sshd", "-T"], timeout=10)
+    if probe.returncode != 0:
+        raise RuntimeError("無法取得 OpenSSH 有效設定（sshd -T）")
+    parsed = {}
+    for line in probe.stdout.splitlines():
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            parsed[parts[0].lower()] = parts[1].strip()
+    if not {"permitrootlogin", "passwordauthentication", "permitemptypasswords"} <= parsed.keys():
+        raise RuntimeError("OpenSSH 有效設定缺少登入安全欄位")
 
     for key, label in keys.items():
         result.append({"設定": label, "值": parsed.get(key, "未設定/預設"), "狀態": "待檢核"})
@@ -548,8 +540,15 @@ def get_mac_status() -> list[dict]:
 
 def get_container_status() -> list[dict]:
     result: list[dict] = []
-    for runtime in ("docker", "podman"):
-        out = _run([runtime, "ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"], timeout=10)
+    docker_socket = f"/run/user/{os.geteuid()}/docker.sock"
+    if not os.path.exists(docker_socket):
+        docker_socket = "/var/run/docker.sock"
+    commands = {
+        "docker": ["docker", "--host", f"unix://{docker_socket}"],
+        "podman": ["podman", "--remote=false"],
+    }
+    for runtime, cmd in commands.items():
+        out = _run(cmd + ["ps", "--format", "{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"], timeout=10)
         if out:
             for line in out.splitlines():
                 parts = line.split("\t")
@@ -767,172 +766,238 @@ def _empty_threat_fields() -> dict:
 def get_process_hashes() -> list[dict]:
     result: list[dict] = []
     package_cache: dict[str, str] = {}
-    try:
-        for pid_str in os.listdir("/proc"):
-            if not pid_str.isdigit():
-                continue
-            pid = int(pid_str)
+    for pid_str in os.listdir("/proc"):
+        if not pid_str.isdigit():
+            continue
+        try:
+            proc_fd = os.open(f"/proc/{pid_str}", os.O_RDONLY | os.O_DIRECTORY)
+        except OSError:
+            continue
+        try:
+            open_in_proc = partial(os.open, dir_fd=proc_fd)
             try:
-                exe = os.readlink(f"/proc/{pid_str}/exe")
-            except Exception:
+                exe = os.readlink("exe", dir_fd=proc_fd)
+            except FileNotFoundError:
+                # 程序已結束，或核心執行緒沒有執行檔。
                 continue
-            if not exe:
-                continue
-
-            is_deleted = "(deleted)" in exe
-            clean_path = exe.replace(" (deleted)", "")
-            proc_name = ""
+            except OSError:
+                exe = ""
             try:
-                proc_name = open(f"/proc/{pid_str}/comm").read().strip()
-            except Exception:
-                pass
+                with open("comm", encoding="utf-8", errors="replace", opener=open_in_proc) as f:
+                    proc_name = f.read().strip()
+            except OSError:
+                proc_name = ""
 
-            row = {
-                "程序名稱": proc_name,
-                "PID": pid,
-                "執行路徑": exe,
-                "SHA256": "",
-                "hash_status": "not_calculated",
-                "套件來源": "",
-                "是否已刪除": "是" if is_deleted else "否",
-                **_empty_threat_fields(),
-            }
-
+            digest = ""
             try:
-                sha = hashlib.sha256()
-                with open(clean_path, "rb") as f:
-                    while True:
-                        chunk = f.read(65536)
-                        if not chunk:
-                            break
+                # 透過 procfs 開啟執行中的檔案，並從同一個描述符取得路徑。
+                with open("exe", "rb", opener=open_in_proc) as f:
+                    exe = os.readlink(f"/proc/self/fd/{f.fileno()}")
+                    sha = hashlib.sha256()
+                    for chunk in iter(lambda: f.read(65536), b""):
                         sha.update(chunk)
-                row["SHA256"] = sha.hexdigest().upper()
-                row["hash_status"] = "ok"
-                row["套件來源"] = _get_package_owner(clean_path, package_cache)
+                digest = sha.hexdigest().upper()
+                hash_status = "ok"
             except PermissionError:
-                row["hash_status"] = "permission_denied"
-            except Exception:
-                row["hash_status"] = "failed"
-            result.append(row)
-    except Exception:
-        pass
+                hash_status = "permission_denied"
+            except OSError:
+                hash_status = "failed"
+        finally:
+            os.close(proc_fd)
+
+        is_deleted = exe.endswith(" (deleted)")
+        result.append({
+            "程序名稱": proc_name,
+            "PID": int(pid_str),
+            "執行路徑": exe,
+            "SHA256": digest,
+            "hash_status": hash_status,
+            "套件來源": _get_package_owner(exe, package_cache) if digest and not is_deleted else "",
+            "是否已刪除": "是" if is_deleted else "否",
+            **_empty_threat_fields(),
+        })
     return result
+
 
 
 def get_netstat() -> list[dict]:
-    result: list[dict] = []
-
-    def _parse_ss(args: list[str], is_established: bool = False) -> list[dict]:
+    def parse_ss(out: str, tcp_only: bool = False) -> list[dict]:
         rows = []
-        out = _run(["ss"] + args, timeout=15)
-        for line in out.splitlines()[1:]:
+        for line in out.splitlines():
             parts = line.split()
-            if len(parts) < 5:
-                continue
-            proto = parts[0].upper()
+            if tcp_only and parts and parts[0].lower() != "tcp":
+                parts.insert(0, "tcp")
+            if len(parts) < 6 or parts[0].lower() not in ("tcp", "udp"):
+                raise ValueError("無法解析 ss 輸出")
             state = parts[1].upper()
-            local = parts[4]
-            remote = parts[5] if len(parts) > 5 else "*"
-            proc_name = ""
-            if len(parts) >= 7:
-                m = re.search(r'users:\(\("([^"]+)"', " ".join(parts))
-                if m:
-                    proc_name = m.group(1)
-            pid_match = re.search(r'pid=(\d+)', " ".join(parts))
-            pid_str = pid_match.group(1) if pid_match else ""
-            if state in ("ESTAB", "ESTABLISHED"):
-                state = "ESTABLISHED"
+            if tcp_only and state not in ("ESTAB", "ESTABLISHED"):
+                continue
+            process = " ".join(parts[6:])
+            name = re.search(r'users:\(\("([^"]+)"', process)
+            pid = re.search(r'pid=(\d+)', process)
             rows.append({
-                "協定":    proto,
-                "本地位址": local,
-                "遠端位址": remote,
-                "狀態":    state,
-                "PID":     pid_str,
-                "程序名稱": proc_name,
+                "協定": parts[0].upper(), "本地位址": parts[4], "遠端位址": parts[5],
+                "狀態": "ESTABLISHED" if state == "ESTAB" else state,
+                "PID": pid[1] if pid else "", "程序名稱": name[1] if name else "",
             })
         return rows
 
-    # 監聽中（TCP/UDP）
-    result += _parse_ss(["-tulnp"])
-    # ESTABLISHED 連線
-    result += _parse_ss(["-tnp"])
+    listeners = _command(["ss", "-H", "-tulnp"])
+    established = _command(["ss", "-H", "-tnp"])
+    if (listeners.returncode, established.returncode) == (0, 0):
+        try:
+            return parse_ss(listeners.stdout) + parse_ss(established.stdout, tcp_only=True)
+        except ValueError:
+            pass
 
-    if not result:
-        # fallback: netstat
-        out = _run(["netstat", "-tulnp"], timeout=15)
-        for line in out.splitlines():
-            if not re.match(r"^(tcp|udp)", line, re.I):
-                continue
-            parts = line.split()
-            if len(parts) < 6:
-                continue
-            proto  = parts[0].upper()
-            local  = parts[3]
-            remote = parts[4]
-            state  = parts[5] if proto.startswith("TCP") and len(parts) > 5 else ""
-            last   = parts[-1] if len(parts) >= 7 else ""
-            pid_s, _, proc = last.partition("/")
-            result.append({
-                "協定":    proto,
-                "本地位址": local,
-                "遠端位址": remote,
-                "狀態":    state,
-                "PID":     pid_s,
-                "程序名稱": proc,
-            })
+    probe = _command(["netstat", "-antup"])
+    if probe.returncode != 0:
+        raise RuntimeError("無法透過 ss 或 netstat 取得網路連線")
+    if not any(line.startswith("Proto") for line in probe.stdout.splitlines()):
+        raise RuntimeError("無法解析 netstat 輸出")
+    rows = []
+    for line in probe.stdout.splitlines():
+        if not re.match(r"^(tcp|udp)", line, re.I):
+            continue
+        parts = line.split()
+        is_tcp = parts[0].startswith("tcp")
+        if len(parts) < (6 if is_tcp else 5):
+            raise RuntimeError("無法解析 netstat 連線欄位")
+        state = parts[5] if is_tcp else "UNCONN"
+        if is_tcp and state not in ("LISTEN", "ESTABLISHED"):
+            continue
+        if not is_tcp and parts[4].rsplit(":", 1)[-1] not in ("*", "0"):
+            continue
+        process = parts[6 if is_tcp else 5:]
+        pid, _, name = (process[0] if process else "").partition("/")
+        rows.append({
+            "協定": parts[0].upper(), "本地位址": parts[3], "遠端位址": parts[4],
+            "狀態": state, "PID": pid if pid.isdigit() else "", "程序名稱": name,
+        })
+    return rows
 
-    return result
+
+def _firewall_row(backend: str, profile: str, enabled: str, detail: str) -> dict:
+    return {"防火牆類型": backend, "設定檔": profile, "啟用": enabled, "詳細資訊": detail.strip()[:400]}
+
+
+def _nft_status(stdout: str) -> tuple[str, str]:
+    entries = json.loads(stdout)["nftables"]
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        raise ValueError("無法解析 nftables 規則")
+    dormant = {(t["family"], t["name"]) for entry in entries if (t := entry.get("table"))
+               and "dormant" in t.get("flags", [])}
+    base_chains = {}
+    rules = {}
+    for entry in entries:
+        if chain := entry.get("chain"):
+            key = (chain["family"], chain["table"], chain["name"])
+            if (chain.get("type") == "filter" and chain.get("hook")
+                    and key[0] in {"inet", "ip", "ip6", "bridge", "netdev"} and key[:2] not in dormant):
+                base_chains[key] = chain.get("policy", "accept")
+        if rule := entry.get("rule"):
+            key = (rule["family"], rule["table"], rule["chain"])
+            rules.setdefault(key, []).extend(rule["expr"])
+
+    pending = list(base_chains)
+    seen = set()
+    blocks = False
+    has_verdict_map = False
+    while pending:
+        key = pending.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        for expr in rules.get(key, []):
+            blocks |= "drop" in expr or "reject" in expr
+            has_verdict_map |= "vmap" in expr
+            for verdict in ("jump", "goto"):
+                if verdict in expr:
+                    pending.append((*key[:2], expr[verdict]["target"]))
+
+    policies = ", ".join(f"{'/'.join(key)}={policy}" for key, policy in base_chains.items()) or "無 filter 基礎鏈"
+    active = "drop" in base_chains.values() or blocks
+    detail = f"{policies}；有 DROP／REJECT 規則：{'是' if blocks else '否'}"
+    return ("是" if active else "未知" if has_verdict_map else "否"), detail
+
+
+def _iptables_status(stdout: str) -> tuple[str, str]:
+    policies = {}
+    targets = {}
+    for line in stdout.splitlines():
+        parts = shlex.split(line)
+        if parts[:1] == ["-P"] and len(parts) == 3:
+            policies[parts[1]] = parts[2]
+        elif parts[:1] == ["-A"] and len(parts) > 2:
+            tokens = iter(parts[2:])
+            for option in tokens:
+                if option == "--comment":
+                    next(tokens, "")
+                elif option in ("-j", "-g"):
+                    targets.setdefault(parts[1], []).append(next(tokens, ""))
+                    break
+    if not {"INPUT", "FORWARD", "OUTPUT"} <= policies.keys():
+        raise ValueError("無法解析 iptables 預設政策")
+    pending = list(policies)
+    seen = set()
+    while pending:
+        chain = pending.pop()
+        if chain not in seen:
+            seen.add(chain)
+            pending.extend(targets.get(chain, []))
+    blocks = bool(seen & {"DROP", "REJECT"})
+    policy_detail = ", ".join(f"{name}={policy}" for name, policy in policies.items())
+    detail = f"{policy_detail}；有 DROP／REJECT 規則：{'是' if blocks else '否'}"
+    return ("是" if "DROP" in policies.values() or blocks else "否"), detail
 
 
 def get_firewall_status() -> list[dict]:
-    result: list[dict] = []
+    rows = []
+    ufw = _command(["ufw", "status", "verbose"], timeout=10)
+    if not ufw.missing:
+        match = re.search(r"^Status:[ \t]*(active|inactive)[ \t]*$", ufw.stdout, re.M | re.I)
+        enabled = {"active": "是", "inactive": "否"}[match[1].lower()] if ufw.returncode == 0 and match else "未知"
+        rows.append(_firewall_row("ufw", "all", enabled, ufw.stdout or ufw.stderr))
 
-    # ufw
-    out = _run(["ufw", "status", "verbose"], timeout=10)
-    if out.strip():
-        status = "否"
-        for line in out.splitlines():
-            if line.lower().startswith("status:"):
-                status = "是" if "active" in line.lower() else "否"
-        result.append({
-            "防火牆類型": "ufw",
-            "設定檔":     "all",
-            "啟用":       status,
-            "詳細資訊":   out.strip()[:400],
-        })
-        return result
+    firewalld = _command(["firewall-cmd", "--state"], timeout=10)
+    if not firewalld.missing:
+        state = (firewalld.stdout or firewalld.stderr).strip().lower()
+        if firewalld.returncode == 0 and state == "running":
+            detail = _command(["firewall-cmd", "--list-all-zones"], timeout=10)
+            enabled = "是" if detail.returncode == 0 and detail.stdout.strip() else "未知"
+            rows.append(_firewall_row("firewalld", "all", enabled, detail.stdout or detail.stderr or "無法取得區域設定"))
+        else:
+            stopped = firewalld.returncode == 252 and state == "not running"
+            rows.append(_firewall_row("firewalld", "all", "否" if stopped else "未知", state))
 
-    # firewalld
-    out = _run(["firewall-cmd", "--state"], timeout=10)
-    if out.strip():
-        enabled = "是" if "running" in out.lower() else "否"
-        detail = _run(["firewall-cmd", "--list-all"], timeout=10)
-        result.append({
-            "防火牆類型": "firewalld",
-            "設定檔":     "default",
-            "啟用":       enabled,
-            "詳細資訊":   detail.strip()[:400],
-        })
-        return result
+    for backend, profile, cmd, parse in (
+        ("nftables", "ruleset", ["nft", "-j", "-n", "list", "ruleset"], _nft_status),
+        ("iptables", "IPv4 filter", ["iptables", "-t", "filter", "-S"], _iptables_status),
+        ("ip6tables", "IPv6 filter", ["ip6tables", "-t", "filter", "-S"], _iptables_status),
+    ):
+        probe = _command(cmd, timeout=10)
+        if probe.missing:
+            continue
+        enabled, detail = "未知", probe.stderr or "無法讀取規則"
+        if probe.returncode == 0:
+            try:
+                enabled, detail = parse(probe.stdout)
+            except (ValueError, KeyError, TypeError, AttributeError):
+                detail = "無法解析規則"
+        rows.append(_firewall_row(backend, profile, enabled, detail))
 
-    # iptables
-    out = _run(["iptables", "-L", "-n", "--line-numbers"], timeout=10)
-    if out.strip():
-        has_rules = any(
-            re.search(r"\b(ACCEPT|DROP|REJECT)\b", ln)
-            for ln in out.splitlines()
-            if not ln.startswith("Chain")
-        )
-        result.append({
-            "防火牆類型": "iptables",
-            "設定檔":     "filter",
-            "啟用":       "是" if has_rules else "否（無規則）",
-            "詳細資訊":   out.strip()[:400],
-        })
-        return result
+    return rows or [_firewall_row("未取得防火牆資料", "", "未知", "找不到可用的防火牆檢查指令")]
 
-    result.append({"防火牆類型": "未偵測到防火牆", "設定檔": "", "啟用": "否", "詳細資訊": ""})
-    return result
+
+def _firewall_assessment(rows: list[dict]) -> str:
+    states = {row.get("啟用") for row in rows}
+    if "未知" in states or None in states:
+        return "UNKNOWN"
+    if "是" in states:
+        return "PASS"
+    if states and states <= {"否", "否（無規則）"}:
+        return "FAIL"
+    return "UNKNOWN"
 
 
 def get_smb_status() -> list[dict]:
@@ -949,10 +1014,7 @@ def get_smb_status() -> list[dict]:
     result.append({"設定": "Samba 版本", "值": ver_out.strip().splitlines()[0]})
 
     # 服務狀態
-    svc_out = _run(["systemctl", "is-active", "smbd"], timeout=5).strip()
-    if not svc_out:
-        svc_out = _run(["service", "smbd", "status"], timeout=5)
-        svc_out = "active（running）" if "running" in svc_out.lower() else "inactive"
+    svc_out = _run(["systemctl", "is-active", "smbd"], timeout=5, ok_codes=(0, 3, 4)).strip() or "未知"
     result.append({"設定": "Samba 服務狀態", "值": svc_out})
 
     # 優先使用 testparm -sv 取得實際生效設定（含 include / 預設值）。
@@ -982,64 +1044,42 @@ def get_smb_status() -> list[dict]:
     return result
 
 
+
 def get_shared_folders() -> list[dict]:
-    result: list[dict] = []
+    result = []
+    try:
+        with open("/etc/samba/smb.conf", encoding="utf-8", errors="replace") as conf:
+            current_share = None
+            for line in conf:
+                line = line.strip()
+                if not line or line.startswith(("#", ";")):
+                    continue
+                heading = re.fullmatch(r"\[(.+)\]", line)
+                if heading:
+                    name = heading[1]
+                    current_share = None
+                    if name.lower() not in ("global", "printers", "print$", "homes"):
+                        current_share = {"共用名稱": name, "路徑": "", "說明": "", "類型": "Samba"}
+                        result.append(current_share)
+                elif current_share is not None and "=" in line:
+                    key, value = line.split("=", 1)
+                    label = {"path": "路徑", "comment": "說明"}.get(key.strip().lower())
+                    if label:
+                        current_share[label] = value.strip()
+    except FileNotFoundError:
+        pass
 
-    # Samba smb.conf
-    for conf in ["/etc/samba/smb.conf"]:
-        if not os.path.isfile(conf):
-            continue
-        try:
-            current_share: str | None = None
-            share_props: dict = {}
-            with open(conf) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith(("#", ";")):
-                        continue
-                    m = re.match(r"^\[(.+)\]$", line)
-                    if m:
-                        if current_share and current_share.lower() not in ("global", "printers", "print$", "homes"):
-                            result.append({
-                                "共用名稱": current_share,
-                                "路徑":     share_props.get("path", ""),
-                                "說明":     share_props.get("comment", ""),
-                                "類型":     "Samba",
-                            })
-                        current_share = m.group(1)
-                        share_props = {}
-                    elif "=" in line and current_share:
-                        k, v = line.split("=", 1)
-                        share_props[k.strip().lower()] = v.strip()
-            if current_share and current_share.lower() not in ("global", "printers", "print$", "homes"):
-                result.append({
-                    "共用名稱": current_share,
-                    "路徑":     share_props.get("path", ""),
-                    "說明":     share_props.get("comment", ""),
-                    "類型":     "Samba",
-                })
-        except Exception as e:
-            result.append({"共用名稱": f"無法讀取設定: {e}", "路徑": "", "說明": "", "類型": ""})
-
-    # NFS exports
-    if os.path.isfile("/etc/exports"):
-        try:
-            with open("/etc/exports") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split(None, 1)
-                    if parts:
-                        result.append({
-                            "共用名稱": os.path.basename(parts[0]) or parts[0],
-                            "路徑":     parts[0],
-                            "說明":     parts[1] if len(parts) > 1 else "",
-                            "類型":     "NFS",
-                        })
-        except Exception:
-            pass
-
+    try:
+        with open("/etc/exports", encoding="utf-8", errors="replace") as conf:
+            for line in conf:
+                fields = line.partition("#")[0].split(None, 1)
+                if fields:
+                    result.append({
+                        "共用名稱": os.path.basename(fields[0]) or fields[0], "路徑": fields[0],
+                        "說明": fields[1].strip() if len(fields) > 1 else "", "類型": "NFS",
+                    })
+    except FileNotFoundError:
+        pass
     return result
 
 
@@ -1047,14 +1087,14 @@ def get_audit_policy() -> list[dict]:
     result: list[dict] = []
 
     # auditd 服務狀態
-    svc = _run(["systemctl", "is-active", "auditd"], timeout=5).strip()
+    svc = _run(["systemctl", "is-active", "auditd"], timeout=5, ok_codes=(0, 3, 4)).strip()
     result.append({"稽核類別": "auditd 服務狀態", "稽核設定": svc if svc else "未知（systemctl 不可用）"})
 
     # auditctl -l（列出規則）
-    rules_out = _run(["auditctl", "-l"], timeout=10)
-    if rules_out.strip():
-        lines = rules_out.strip().splitlines()
-        if lines and lines[0].strip() in ("-a never,task", "No rules"):
+    rules = _command(["auditctl", "-l"], timeout=10)
+    if rules.returncode == 0:
+        lines = rules.stdout.strip().splitlines()
+        if not lines or lines[0].strip() in ("-a never,task", "No rules"):
             result.append({"稽核類別": "稽核規則", "稽核設定": "無規則（No auditing）"})
         else:
             for line in lines:
@@ -1369,25 +1409,15 @@ def _analyze_startup_items(startup_items: list[dict]) -> list[dict]:
     return findings
 
 
+
 def _analyze_firewall(firewall_data: list[dict]) -> list[dict]:
-    findings: list[dict] = []
-    for profile in firewall_data:
-        if profile.get("防火牆類型") == "未偵測到防火牆":
-            findings.append(_finding(
-                "firewall", 3,
-                "未偵測到任何防火牆",
-                "未找到 ufw / firewalld / iptables，主機缺乏網路層防護。",
-                profile,
-            ))
-        elif profile.get("啟用") in ("否", "否（無規則）"):
-            fw_type = profile.get("防火牆類型", "")
-            findings.append(_finding(
-                "firewall", 3,
-                f"防火牆未啟用：{fw_type}",
-                f"{fw_type} 未啟用或無規則，主機缺乏網路層保護。",
-                profile,
-            ))
-    return findings
+    if _firewall_assessment(firewall_data) != "FAIL":
+        return []
+    return [_finding(
+        "firewall", 3, "未偵測到啟用的主機防火牆",
+        "已查得的防火牆均未啟用或未偵測到封包阻擋政策；請確認主機防護設定。",
+        {"防火牆": firewall_data},
+    )]
 
 
 def _analyze_smb(smb_data: list[dict]) -> list[dict]:
@@ -1684,131 +1714,105 @@ def calculate_risk(findings: list[dict]) -> tuple[int, str]:
     return host_score(findings)
 
 
+
 def build_compliance_summary(report_data: dict, findings: list[dict]) -> list[dict]:
-    """行政院資安健診常看重點，置頂顯示並用顏色快速判讀。"""
-    policy = {item.get("設定", ""): item.get("值", "") for item in report_data.get("密碼原則", [])}
+    """彙整已取得的資料並標明未能判定的項目。"""
+    collection = report_data.get("meta", {}).get("collection_status", {})
+    policy = {item.get("設定"): item.get("值") for item in report_data.get("密碼原則", [])}
     users = report_data.get("使用者帳號", [])
     priv = report_data.get("特權帳號", [])
     av = report_data.get("防毒工具", [])
     fw = report_data.get("防火牆狀態", [])
-    ssh = {item.get("設定", ""): str(item.get("值", "")) for item in report_data.get("SSH安全設定", [])}
-    audit = {item.get("稽核類別", ""): item.get("稽核設定", "") for item in report_data.get("稽核原則", [])}
-    updates = {item.get("項目", ""): item.get("內容", "") for item in report_data.get("更新狀態", [])}
+    ssh = {item.get("設定"): item.get("值", "") for item in report_data.get("SSH安全設定", [])}
+    audit = {item.get("稽核類別"): item.get("稽核設定", "") for item in report_data.get("稽核原則", [])}
+    updates = {item.get("項目"): item.get("內容") for item in report_data.get("更新狀態", [])}
     shares = report_data.get("網路分享", []) or report_data.get("共用資料夾", [])
     listening = [
-        n for n in report_data.get("網路連線", [])
-        if str(n.get("狀態", "")).upper() in ("LISTEN", "LISTENING")
+        conn for conn in report_data.get("網路連線", [])
+        if str(conn.get("狀態", "")).upper() in ("LISTEN", "LISTENING", "UNCONN")
     ]
+    summary = []
 
-    def row(item: str, value: str, status: str, suggestion: str) -> dict:
-        return {"檢核項目": item, "目前狀態": value, "判定": status, "建議": suggestion}
+    def add(section: str, item: str, value: str, status: str, suggestion: str) -> None:
+        if collection.get(section) == "failed":
+            value, status = "無法取得", "UNKNOWN"
+        summary.append({"檢核項目": item, "目前狀態": value, "判定": status, "建議": suggestion})
 
-    summary: list[dict] = []
+    for key, name, passes, failure, tip in [
+        ("PASS_MIN_LEN", "密碼最短長度", lambda n: n >= 8, "FAIL", "請確認 PAM 與 login.defs 的密碼長度政策。"),
+        ("PASS_MAX_DAYS", "密碼最長期限", lambda n: 0 < n <= 180, "WARN", "建議依機關政策設定密碼期限。"),
+    ]:
+        value = str(policy.get(key, "未取得"))
+        try:
+            status = "PASS" if passes(int(value)) else failure
+        except ValueError:
+            status = "UNKNOWN"
+        add("密碼原則", name, value, status, tip)
 
-    min_len = policy.get("PASS_MIN_LEN", "未設定")
-    try:
-        min_len_i = int(min_len)
-        summary.append(row(
-            "密碼最短長度",
-            str(min_len_i),
-            "PASS" if min_len_i >= 8 else "FAIL",
-            "建議至少 8 字元，若適用更高要求可提升至 12 字元。",
-        ))
-    except Exception:
-        summary.append(row("密碼最短長度", str(min_len), "WARN", "未能確認 PASS_MIN_LEN，請檢查 PAM / login.defs。"))
+    interactive = [user for user in users if (user.get("帳號類型") == "一般使用者" or user.get("帳號名稱") == "root")
+                   and user.get("是否啟用") == "啟用"]
+    user_count_known = collection.get("使用者帳號") == "ok" or any(user.get("是否啟用") for user in users)
+    add("使用者帳號", "非系統帳號 / 可互動帳號", f"{len(interactive)} 個" if user_count_known else "無資料",
+        "INFO" if user_count_known else "UNKNOWN", "請確認帳號用途及人員異動後的停用流程。")
 
-    max_days = policy.get("PASS_MAX_DAYS", "未設定")
-    try:
-        max_days_i = int(max_days)
-        summary.append(row(
-            "密碼最長期限",
-            str(max_days_i),
-            "PASS" if 0 < max_days_i <= 180 else "WARN",
-            "建議依機關政策設定密碼期限，避免 99999 或永不過期。",
-        ))
-    except Exception:
-        summary.append(row("密碼最長期限", str(max_days), "WARN", "未能確認 PASS_MAX_DAYS。"))
+    priv_count = sum(bool(account.get("權限來源")) for account in priv)
+    priv_known = bool(priv_count) or collection.get("特權帳號") == "ok"
+    add("特權帳號", "特權帳號", f"{priv_count} 個" if priv_known else "無資料",
+        ("WARN" if priv_count > 1 else "PASS") if priv_known else "UNKNOWN", "請定期盤點 sudo / wheel / UID 0。")
 
-    interactive = [
-        u for u in users
-        if (u.get("帳號類型") == "一般使用者" or u.get("帳號名稱") == "root")
-        and u.get("是否啟用") == "啟用"
-    ]
-    summary.append(row(
-        "非系統帳號 / 可互動帳號",
-        f"{len(interactive)} 個",
-        "INFO" if interactive else "PASS",
-        "請確認是否皆有對應人員、用途與離職停用流程。",
-    ))
+    av_states = {tool.get("狀態") for tool in av}
+    av_status = "UNKNOWN"
+    if "無法取得" not in av_states:
+        if "已安裝" in av_states:
+            av_status = "INFO"
+        elif "未安裝" in av_states:
+            av_status = "WARN"
+    add("防毒工具", "防毒 / 端點防護", "、".join(tool.get("工具", "") for tool in av) or "無資料",
+        av_status, "請依主機用途確認端點防護工具及保護狀態。")
 
-    priv_count = len([p for p in priv if p.get("權限來源")])
-    summary.append(row(
-        "特權帳號",
-        f"{priv_count} 個",
-        "WARN" if priv_count > 1 else "PASS",
-        "sudo / wheel / UID 0 帳號需定期盤點並留存授權紀錄。",
-    ))
+    firewall_value = "；".join(f"{item.get('防火牆類型')}={item.get('啟用')}" for item in fw)
+    add("防火牆狀態", "主機防火牆", firewall_value or "無資料", _firewall_assessment(fw),
+        "請確認 nftables / iptables 的有效政策及管理工具狀態。")
 
-    av_missing = av and av[0].get("狀態") == "未安裝"
-    summary.append(row(
-        "防毒 / 端點防護",
-        av[0].get("工具", "無資料") if av else "無資料",
-        "WARN" if av_missing else "PASS",
-        "Linux Server 可依政策採 EDR、ClamAV、完整性檢查或集中監控。",
-    ))
+    root_login = ssh.get("允許 root 登入", "")
+    pass_auth = ssh.get("允許密碼登入", "")
+    empty_passwords = ssh.get("允許空密碼", "")
+    ssh_status = "UNKNOWN"
+    if empty_passwords == "yes":
+        ssh_status = "FAIL"
+    elif root_login == "yes" or pass_auth == "yes":
+        ssh_status = "WARN"
+    elif (root_login in ("no", "prohibit-password", "without-password", "forced-commands-only")
+          and pass_auth == empty_passwords == "no"):
+        ssh_status = "PASS"
+    add("SSH安全設定", "SSH 登入安全",
+        f"RootLogin={root_login or '未知'}, PasswordAuth={pass_auth or '未知'}, EmptyPasswords={empty_passwords or '未知'}",
+        ssh_status, "請確認有效設定，並依連線條件檢視 Match 規則。")
 
-    fw_bad = any(f.get("啟用") in ("否", "否（無規則）") or f.get("防火牆類型") == "未偵測到防火牆" for f in fw)
-    summary.append(row(
-        "主機防火牆",
-        "; ".join(f"{f.get('防火牆類型')}={f.get('啟用')}" for f in fw) if fw else "無資料",
-        "FAIL" if fw_bad else "PASS",
-        "建議啟用 ufw / firewalld / nftables / iptables 並限制入站服務。",
-    ))
+    audit_state = audit.get("auditd 服務狀態", "")
+    audit_rules = audit.get("稽核規則", "")
+    audit_status = "UNKNOWN"
+    if audit_state in ("inactive", "failed") or audit_rules.startswith("無規則"):
+        audit_status = "WARN"
+    elif audit_state == "active" and audit_rules:
+        audit_status = "PASS"
+    add("稽核原則", "稽核記錄 auditd", audit_state or "未知", audit_status,
+        "請確認 auditd 服務狀態及已載入的稽核規則。")
 
-    root_login = ssh.get("允許 root 登入", "未偵測")
-    pass_auth = ssh.get("允許密碼登入", "未偵測")
-    ssh_bad = root_login.lower() == "yes" or pass_auth.lower() == "yes"
-    summary.append(row(
-        "SSH 登入安全",
-        f"RootLogin={root_login}, PasswordAuth={pass_auth}",
-        "WARN" if ssh_bad else "PASS",
-        "建議停用 root 直接登入，改用金鑰登入與 sudo 管理。",
-    ))
+    update_count = str(updates.get("可更新套件數", "未知"))
+    update_status = ("INFO" if update_count == "0" else "WARN") if update_count.isdecimal() else "UNKNOWN"
+    add("更新狀態", "修補 / 更新狀態", update_count, update_status,
+        "資料來自本機套件索引，請確認索引更新時間與安全性修補狀態。")
 
-    audit_state = audit.get("auditd 服務狀態", "未知")
-    summary.append(row(
-        "稽核記錄 auditd",
-        audit_state,
-        "PASS" if audit_state == "active" else "WARN",
-        "建議啟用 auditd 並設定登入、權限提升、重要檔案變更等規則。",
-    ))
+    listeners_known = collection.get("網路連線") == "ok" or bool(listening)
+    add("網路連線", "對外監聽服務", f"{len(listening)} 個" if listeners_known else "無資料",
+        ("INFO" if listening else "PASS") if listeners_known else "UNKNOWN",
+        "請確認監聽服務的業務必要性、來源限制與防火牆規則。")
 
-    update_count = updates.get("可更新套件數", "未知")
-    try:
-        upd_i = int(update_count)
-        upd_status = "PASS" if upd_i == 0 else "WARN"
-    except Exception:
-        upd_status = "INFO"
-    summary.append(row(
-        "修補 / 更新狀態",
-        str(update_count),
-        upd_status,
-        "請確認可更新套件是否包含安全性修補，並保留更新紀錄。",
-    ))
-
-    summary.append(row(
-        "對外監聽服務",
-        f"{len(listening)} 個",
-        "INFO" if listening else "PASS",
-        "請確認每個 LISTEN 服務的業務必要性、來源限制與防火牆規則。",
-    ))
-
-    summary.append(row(
-        "網路分享 / 對外目錄",
-        f"{len(shares)} 筆",
-        "WARN" if shares else "PASS",
-        "若存在 Samba / NFS / Web / FTP 對外目錄，請確認最小權限與存取控制。",
-    ))
+    shares_known = collection.get("網路分享") == "ok" or bool(shares)
+    add("網路分享", "網路分享 / 對外目錄", f"{len(shares)} 筆" if shares_known else "無資料",
+        ("WARN" if shares else "PASS") if shares_known else "UNKNOWN",
+        "請確認 Samba / NFS 共用的最小權限與存取控制。")
 
     return summary
 
@@ -1863,6 +1867,7 @@ tr:hover td { background: #f8f9fa; }
 .st-WARN { background:#ffc107; color:#212529; }
 .st-FAIL { background:#dc3545; }
 .st-INFO { background:#0dcaf0; color:#212529; }
+.st-UNKNOWN { background:#6c757d; }
 .focus-note { color:#6c757d; font-size:12px; margin-bottom:10px; }
 """
 
@@ -1961,6 +1966,16 @@ def generate_html(computer_name: str, local_ip: str, report_data: dict,
     risk_color = RISK_COLORS.get(risk_level, "#6c757d")
     now_str    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     focus_summary = build_compliance_summary(report_data, findings)
+    collection = report_data.get("meta", {}).get("collection_status", {})
+    failed = [section for section, status in collection.items() if status == "failed"]
+    unknown = [row["檢核項目"] for row in focus_summary if row["判定"] == "UNKNOWN"]
+    coverage = ""
+    if failed or unknown:
+        detail = "；".join(filter(None, [
+            f"收集失敗：{'、'.join(failed)}" if failed else "",
+            f"無法判定：{'、'.join(unknown)}" if unknown else "",
+        ]))
+        coverage = f'<p class="focus-note"><strong>部分檢查未完成</strong>。{html.escape(detail)}</p>'
 
     def findings_rows() -> str:
         rows = []
@@ -2036,6 +2051,7 @@ def generate_html(computer_name: str, local_ip: str, report_data: dict,
     IP：<strong>{local_ip}</strong> &nbsp;|&nbsp;
     產生時間：{now_str}
   </p>
+  {coverage}
   <div class="card" id="focus_sec">
     <div class="card-header">行政院資安健診重點摘要</div>
     <div class="card-body">{_focus_table(focus_summary)}</div>
@@ -2078,11 +2094,16 @@ def generate_html(computer_name: str, local_ip: str, report_data: dict,
 # ─────────────────────────────────────────────────────────────────────────────
 # XLSX 產生
 # ─────────────────────────────────────────────────────────────────────────────
+_XLSX_INVALID_XML = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
 def _safe_cell(val):
-    s = str(val) if not isinstance(val, (int, float, type(None))) else val
-    if isinstance(s, str) and s and s[0] in ("=", "+", "-", "@", "|", "%"):
-        return "'" + s
-    return val
+    if val is None or isinstance(val, (int, float)):
+        return val
+    text = _XLSX_INVALID_XML.sub("", str(val))
+    if text.startswith(("=", "+", "-", "@", "|", "%")):
+        return "'" + text
+    return text
 
 
 def _write_sheet(ws, data: list, field_order: list | None = None) -> None:
@@ -2117,7 +2138,7 @@ def generate_xlsx(report_data: dict, findings: list) -> "Workbook":
             SEVERITY_LABEL.get(f.get("severity", 0), ""),
             _safe_cell(f.get("title", "")),
             _safe_cell(f.get("detail", "")),
-            f.get("status", "open"),
+            _safe_cell(f.get("status", "open")),
         ])
 
     sheet_cfg = [
@@ -2260,15 +2281,19 @@ def main() -> None:
             "computer_name": computer_name,
             "local_ip":      local_ip,
             "generated_at":  datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "collection_status": {},
         }
     }
+    collection = report_data["meta"]["collection_status"]
     for label, func, key in steps:
         _print(label)
         try:
             report_data[key] = func()
+            collection[key] = "ok"
         except Exception as e:
             _print(f"  [錯誤] {key}: {e}")
             report_data[key] = []
+            collection[key] = "failed"
 
     _print("\n[分析] 執行風險評估...")
     findings               = analyze_findings(report_data)
